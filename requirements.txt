@@ -1,0 +1,5 @@
+Pillow>=10.0
+requests>=2.31
+fastapi>=0.115
+uvicorn>=0.30
+pydantic>=2.0

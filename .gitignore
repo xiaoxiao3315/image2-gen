@@ -1,0 +1,37 @@
+.env
+__pycache__/
+.pytest_cache/
+runs/
+*.pyc
+
+# --- 上传公开仓库时排除（调研过程 / 敏感 / 大二进制）---
+# 调研与探测过程文件
+probe_*.py
+run_*.py
+build_acceptance_report.py
+*-2026-*.md
+*-2026-*.csv
+*-2026-*.json
+three-key-*
+key-routing-*
+key-c-*
+detector-*.json
+detector-*
+auth-method-probe-*
+official-sdk-probe-*
+req_*.json
+resp.tmp
+# 结果/输出目录
+acceptance-results/
+banana-async-results/
+codex-image2-results/
+codex-stream-results/
+gemini-nano-results/
+misc-capability-results/
+output/
+runs/
+# 大二进制（Real-ESRGAN 另行下载，见 README）
+tools/realesrgan-ncnn-vulkan/
+# 索引/缓存
+.codegraph/
+NVIDIA Corporation/
