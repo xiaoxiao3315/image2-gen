@@ -38,12 +38,25 @@ def cleanup(data_root: Path, older_than_days: float, *, now: float | None = None
         source_column = (
             "source_filename" if "source_filename" in columns else "NULL AS source_filename"
         )
-        rows = connection.execute(
-            f"SELECT task_id,image_filename,{source_column} FROM tasks "
-            "WHERE status IN ('done','failed') "
-            "AND COALESCE(completed_at,created_at) < ?",
-            (cutoff,),
-        ).fetchall()
+        batch_column = "batch_id" if "batch_id" in columns else "NULL AS batch_id"
+        if "batch_id" in columns:
+            rows = connection.execute(
+                f"SELECT task_id,image_filename,{source_column},{batch_column} FROM tasks "
+                "WHERE (batch_id IN ("
+                "SELECT batch_id FROM tasks WHERE batch_id IS NOT NULL GROUP BY batch_id "
+                "HAVING SUM(CASE WHEN status NOT IN ('done','failed') THEN 1 ELSE 0 END)=0 "
+                "AND MAX(COALESCE(completed_at,created_at)) < ?"
+                ") OR (batch_id IS NULL AND status IN ('done','failed') "
+                "AND COALESCE(completed_at,created_at) < ?))",
+                (cutoff, cutoff),
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                f"SELECT task_id,image_filename,{source_column},{batch_column} FROM tasks "
+                "WHERE status IN ('done','failed') "
+                "AND COALESCE(completed_at,created_at) < ?",
+                (cutoff,),
+            ).fetchall()
         for row in rows:
             for path in (
                 _safe_child(images, row["image_filename"]),
@@ -53,6 +66,19 @@ def cleanup(data_root: Path, older_than_days: float, *, now: float | None = None
                     path.unlink(missing_ok=True)
             connection.execute("DELETE FROM tasks WHERE task_id=?", (row["task_id"],))
             removed += 1
+        tables = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        if "api_idempotency" in tables:
+            connection.execute(
+                "DELETE FROM api_idempotency "
+                "WHERE NOT EXISTS ("
+                "SELECT 1 FROM tasks WHERE tasks.batch_id=api_idempotency.batch_id"
+                ")"
+            )
     return removed
 
 

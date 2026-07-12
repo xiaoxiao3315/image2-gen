@@ -28,6 +28,69 @@ Real-ESRGAN 二进制未包含在仓库中，请自行下载并放到 `tools/rea
 
 超分端现在是拉取式 GPU worker 池，不再绑定某一台固定电脑。每个 GPU worker 只需持有同一个内部 worker 令牌和自己唯一的 `IMAGE_UPSCALE_WORKER_ID`，即可从任意 NAT 后网络主动连接云端领活。SQLite 原子领取保证同一任务只交给一个 worker；领取记录包含 worker 身份、随机 claim token、租约心跳和尝试次数。worker 正常运行会续租，处理失败会立即释放供其他 worker 重试，进程或机器失联则在租约到期后自动恢复。增加一台 GPU 机器并启动 worker 就会增加池容量，不需要让云服务器反向连接 GPU。
 
+对外开发者流量使用 LiteLLM Proxy 作为独立网关：Nginx 将 OpenAI 兼容的生图请求转到只监听回环地址 `127.0.0.1:4000` 的 LiteLLM，再由 LiteLLM 调用 `127.0.0.1:8012` 上的私有流水线适配端点。LiteLLM 负责虚拟 Key、每 Key RPM/预算、SpendLogs 和模型 ACL；SQLite 图片任务账本继续独立保存，不写入 LiteLLM 核心表。客户只会看到公共别名 `image-gen`，看不到上游模型、渠道地址或 GPU worker。
+
+## 对外开发者 API（LiteLLM）
+
+正式客户接口是 OpenAI Images 兼容接口：
+
+```http
+POST /v1/images/generations
+Authorization: Bearer <customer-virtual-key>
+Idempotency-Key: <stable-client-request-id>
+Content-Type: application/json
+
+{"model":"image-gen","prompt":"雨后未来城市街景，无文字，无水印","n":2,"size":"2048x2048","response_format":"url"}
+```
+
+- `model` 只能是 `image-gen`；虚拟 Key 查询 `GET /v1/models` 也只看到该别名，直连 `image-pipeline-private` 返回 403。
+- `n` 为 `1`–`5`。每张图独立进入云端任务账本、独立超分，全部完成后以 OpenAI 图片响应格式返回 URL 数组。
+- `size` 支持 `2048x2048`（2K）或 `3840x2160`（4K）；最终文件仍由服务器 Pillow 复验真实像素。
+- `Idempotency-Key` 建议每个客户逻辑请求固定使用；同一虚拟 Key 重放相同请求复用原 batch，不同请求复用同一 Key 返回 409。
+- `GET /v1/stats` 使用同一个客户虚拟 Key。Nginx 通过内部 `auth_request` 调 LiteLLM `/v1/models` 验证 Key，验证通过后才访问私有 stats 端点；没有另写一套客户鉴权。
+- 该接口后端最多等待 900 秒，LiteLLM 上游等待 910 秒，Nginx 读取/发送超时为 930 秒；外层必须比内层多留响应构造余量，客户端自身超时应大于 930 秒。领导网页仍使用下文的异步 `/v1/generate`、`/v1/result/{id}`，互不影响。
+
+LiteLLM 生产部署固定为数据库镜像 `v1.91.2` 的不可漂移 digest，PostgreSQL 同样固定到 16.14/Alpine 3.24。配置见 [deploy/litellm](deploy/litellm)：
+
+```bash
+cd /opt/image2-gen/deploy/litellm
+sudo install -o root -g root -m 0600 litellm.env.example /etc/image2-gen/litellm.env
+# 编辑 /etc/image2-gen/litellm.env 并填写所有占位符；真实文件不得复制回仓库。
+sudo systemctl enable --now image2-gen-gateway.service
+sudo docker compose --env-file /etc/image2-gen/litellm.env -f docker-compose.yml ps
+curl --fail http://127.0.0.1:4000/health/liveliness
+```
+
+安装 Nginx 时，还要从与 `IMAGE_LITELLM_BACKEND_TOKEN` 相同的值生成 root 所有、`0640` 权限的 `/etc/nginx/snippets/image2-gen-backend-auth.conf`；仓库只提供占位模板 [image2-gen-backend-auth.conf.example](deploy/nginx/image2-gen-backend-auth.conf.example)。不要把填好令牌的 snippet 放进 Git。
+
+管理员只在服务器回环地址用 master key 创建客户虚拟 Key，例如：
+
+```bash
+curl --fail http://127.0.0.1:4000/key/generate \
+  -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"models":["image-gen"],"rpm_limit":5,"max_budget":20,"duration":"30d","key_alias":"customer-placeholder"}'
+```
+
+每个客户单独生成 Key，分别设置 RPM 和预算；master key 不提供给客户。LiteLLM `input_cost_per_image` 使用美元口径，来自 `IMAGE_COST_USD_PER_IMAGE`，应填写对客户计量的每张价格而不是渠道人民币成本。真实 LiteLLM 1.91.2 集成已验证 `n=1` 记 0.01、`n=5` 记 0.05，金额随 `n` 线性增长。
+
+小内存服务器上，LiteLLM 在本地稳定运行时实测约 700–750 MiB，但目标云主机首次 Prisma 迁移时，900 MiB 与 1200 MiB 限制均会触发 cgroup OOM；因此生产容器限制为 1600 MiB、内存预留为 768 MiB，PostgreSQL 限制为 256 MiB。云端 Python 服务仍独立保持 systemd `MemoryHigh=450M`、`MemoryMax=500M`。部署前必须确认主机至少有约 3.5 GiB 内存和可用 swap，并监控三个进程，不能只看 Python 服务。
+
+2026-07-12 目标云真实验收已完成：两个临时虚拟 Key 并发提交 `n=1` 与 `n=2`，三张成品均从公网 URL 下载并由 Pillow 解码为 2048×2048 PNG；同一个幂等键在两个客户作用域内形成两条相互隔离的账本记录，SpendLogs 增量为 `0.01 + 0.02` USD。测试期间 Python 后端峰值 143.324 MiB、LiteLLM 峰值 1197.477 MiB、主机可用内存最低 1075.164 MiB，服务无重启、无 OOM。完整证据见 [弹性服务验收记录](docs/elastic-service-validation.md)。
+
+客户虚拟 Key、提示词和图片 URL 不能走明文 HTTP。当前 IP+HTTP 配置仅保留给单人演示；签发正式客户 Key 前必须配置域名、可信 TLS 证书和 HTTP→HTTPS 强制跳转。8012、4000、55432 均只允许回环访问，防火墙不得对公网放行。
+
+```bash
+# 先把 Nginx server_name 改成已解析到该服务器的真实域名，再签证书。
+sudo apt-get install -y certbot python3-certbot-nginx
+sudo certbot --nginx --redirect -d api.example.com
+sudo nginx -t
+sudo systemctl reload nginx
+curl --fail https://api.example.com/health
+```
+
+`api.example.com` 只是文档占位符。没有可验证域名和可信证书时，只能继续做内部验收，不能发放正式客户 Key。
+
 ## 环境变量
 
 真实 Key/令牌只注入进程环境，绝不写进代码、日志、返回体或 Git。仓库中的 [.env.example](.env.example) 和 [云端 systemd 环境模板](deploy/systemd/image2-gen.env.example) 只有占位符。
@@ -36,15 +99,21 @@ Real-ESRGAN 二进制未包含在仓库中，请自行下载并放到 `tools/rea
 
 - `IMAGE_API_KEY`（或备用名 `OPENAI_API_KEY`）与 `IMAGE_API_BASE_URL`：渠道凭据与占位 URL。
 - `IMAGE_SERVICE_DATA`：SQLite、原图和成品目录；systemd 固定为 `/var/lib/image2-gen`。
-- `IMAGE_GENERATION_WORKERS`：云端原图生成线程数，默认 `3`，允许 `1`–`5`；无论环境变量或网页如何设置，出图侧全局硬上限始终为 `5`。
+- `IMAGE_GENERATION_MIN_WORKERS` / `IMAGE_GENERATION_MAX_WORKERS`：弹性出图 worker 的空闲下限与积压上限，默认 `1` / `3`；全局硬上限为 `8`。旧变量 `IMAGE_GENERATION_WORKERS` 只作为 max 的兼容回退。
+- `IMAGE_GENERATION_IDLE_RETIRE_SECONDS`：扩容 worker 的空闲回落时间，默认 `30` 秒。
+- `IMAGE_GENERATION_SHUTDOWN_TIMEOUT_SECONDS`：优雅停机 drain 时间，默认 `990` 秒；它覆盖最坏情况下 3 次“20 秒连接 + 300 秒读取”及退避，配合 systemd 1020 秒停止窗口，避免进行中的计费请求被强杀。
 - `IMAGE_FIXED_QUALITY`：当前服务统一生成质量，默认 `low`。
 - `IMAGE_API_CONNECT_TIMEOUT_SECONDS`：渠道连接超时，默认 `20` 秒。
 - `IMAGE_API_TIMEOUT_SECONDS`：渠道读取超时，默认 `300` 秒。
-- `IMAGE_API_MAX_ATTEMPTS`：503、连接错误或超时的最大总尝试次数，默认 `3`，允许 `1`–`5`。
+- `IMAGE_API_MAX_ATTEMPTS`：503、连接错误或超时的最大总尝试次数，默认 `3`，允许 `1`–`3`；上限与停机 drain 的最坏时间预算绑定。
 - `IMAGE_API_COST_CNY_FIXED`：异步服务使用的已核验渠道打包单价；只从环境变量读取。
 - `PUBLIC_BASE_URL`：领导打开的云端公网基址，不带末尾 `/`；当前格式为 `http://<云服务器公网IP>`。
 - `IMAGE_SERVICE_TOKEN`：领导网页/API 的可选 Bearer 令牌。
+- `IMAGE_REQUIRE_SERVICE_AUTH`：生产模板固定为 `true`；未填 `IMAGE_SERVICE_TOKEN` 时领导提交/查询接口返回 503，而不是无鉴权放行。本机开发若明确需要无令牌模式才设为 `false`。
 - `IMAGE_UPSCALE_WORKER_TOKEN`：云端与本机共享的 worker 专用令牌，至少 32 位，且必须与 `IMAGE_SERVICE_TOKEN` 不同。
+- `IMAGE_LITELLM_BACKEND_TOKEN`：LiteLLM 到私有流水线适配端点的第三个独立令牌，至少 32 位，必须与领导令牌、worker 令牌均不同。
+- `IMAGE_LITELLM_PRIVATE_MODEL` / `IMAGE_PUBLIC_MODEL_ALIAS`：当前部署契约固定为 `image-pipeline-private` / `image-gen`，前者永不暴露给客户。不要只改其中一个；如确需改名，必须同时修改 LiteLLM 配置、hook 和后端适配器并重新跑隔离测试。
+- `IMAGE_LITELLM_SYNC_TIMEOUT_SECONDS`：开发者同步图片接口等待终态的秒数，部署默认 `900`。
 - `IMAGE_UPSCALE_LEASE_SECONDS`：worker 任务租约，默认 `600` 秒。
 - `IMAGE_UPSCALE_MAX_ATTEMPTS`：超分失败后的最大领取次数，默认 `3`，允许 `1`–`10`；超过后任务进入终态失败，避免确定性坏图无限重试。
 - `IMAGE_UPSCALE_MAX_UPLOAD_BYTES`：worker 最终 PNG 上传上限；代码默认 25 MiB，部署模板为 50 MiB。
@@ -90,13 +159,13 @@ Content-Type: application/json
 {"prompt":"雨后未来城市街景，无文字，无水印","size":"4k","count":5,"concurrency":5}
 ```
 
-`count` 和 `concurrency` 均为可选字段：`count` 默认 `1`，表示同一提示词生成多少个不同变体；`concurrency` 默认 `3`，表示该批次希望同时发起多少个单图请求。后端先尝试以渠道原生 `n=count` 一次生成多张；只有渠道明确拒绝 `n>1` 时，才回退为最多 `concurrency` 路并发单图请求，不会把网络超时误判成“不支持 n”并盲目重发。回退并发还同时受 `IMAGE_GENERATION_WORKERS` 和全局硬上限 `5` 约束。
+`count` 和 `concurrency` 均为可选字段：`count` 默认 `1`，表示同一提示词生成多少个不同变体；`concurrency` 默认 `3`，表示该批次希望同时发起多少个单图请求。后端先尝试以渠道原生 `n=count` 一次生成多张；渠道明确拒绝 `n>1`，或 HTTP 200 实际返回张数少于 `count` 时，才回退为最多 `concurrency` 路并发单图请求。若原生调用已经返回部分图片，会保留这些已付费结果，只为缺少的张数发起单图请求；进程内还会记住该渠道不支持原生 batch，后续 batch 直接走单图并发。网络超时不会被误判成“不支持 n”并盲目切换请求形态。单批张数与网页档位仍硬限制为 `5`；多个 batch 的出图 worker 会按积压从 `IMAGE_GENERATION_MIN_WORKERS` 自动扩到 `IMAGE_GENERATION_MAX_WORKERS`，全局代码硬上限为 `8`。
 
 `POST /v1/generate` 返回 HTTP 202、`batch_id`、`task_ids`、`result_urls` 和 `batch_result_url`。逐张查询 `GET /v1/result/{task_id}`，或用 `GET /v1/batch/{batch_id}` 一次查看整批摘要与结果；每张完成时都有独立的 `image_url`。当 `count=1` 时，响应仍额外保留原有的 `task_id` 和 `result_url`，旧客户端无需修改。若设置了 `IMAGE_SERVICE_TOKEN`，API 请求须带 `Authorization: Bearer <token>`，网页也会带上用户填写的令牌。
 
 健康检查：`GET /health`。
 
-渠道调用只会对 HTTP 503、连接错误和超时做有限指数退避重试，默认最多三次；同一逻辑请求在全部尝试中复用同一个 `Idempotency-Key`。这能在渠道支持幂等语义时避免超时后的重复生成/计费；若渠道不保证幂等，可将 `IMAGE_API_MAX_ATTEMPTS=1` 关闭自动重发。图片 URL 下载失败不会重新调用出图 API。
+渠道调用只会对 HTTP 503、连接错误和超时做有限指数退避重试，默认最多三次；同一逻辑请求在全部尝试中复用同一个 `Idempotency-Key`。上游幂等键在任务创建时即持久化到 SQLite，服务进程重启后仍复用原值，而不是生成新 Key 重发。这能在渠道支持幂等语义时避免超时或重启后的重复生成/计费；若渠道不保证幂等，可将 `IMAGE_API_MAX_ATTEMPTS=1` 关闭自动重发。图片 URL 下载失败不会重新调用出图 API。
 
 ### 领导如何访问
 
@@ -122,25 +191,37 @@ sudo install -o root -g image2gen -m 0640 deploy/systemd/image2-gen.env.example 
 
 ```bash
 sudo install -o root -g root -m 0644 deploy/systemd/image2-gen.service /etc/systemd/system/image2-gen.service
+sudo install -o root -g root -m 0644 deploy/systemd/image2-gen-gateway.service /etc/systemd/system/image2-gen-gateway.service
 sudo install -o root -g root -m 0644 deploy/systemd/image2-gen-cleanup.service /etc/systemd/system/image2-gen-cleanup.service
 sudo install -o root -g root -m 0644 deploy/systemd/image2-gen-cleanup.timer /etc/systemd/system/image2-gen-cleanup.timer
+sudo install -o root -g root -m 0600 deploy/litellm/litellm.env.example /etc/image2-gen/litellm.env
+# 编辑 /etc/image2-gen/litellm.env；其中 IMAGE_LITELLM_BACKEND_TOKEN 必须与
+# /etc/image2-gen/image2-gen.env 中的同名值一致，其余 secret 必须各不相同。
 sudo apt-get install -y nginx
+docker --version
+docker compose version
+sudo install -o root -g root -m 0640 deploy/nginx/image2-gen-backend-auth.conf.example /etc/nginx/snippets/image2-gen-backend-auth.conf
+# 编辑上述 snippet，把占位符替换成同一个 IMAGE_LITELLM_BACKEND_TOKEN。
 sudo install -o root -g root -m 0644 deploy/nginx/image2-gen.conf /etc/nginx/sites-available/image2-gen
 # 将配置中的 your-cloud-public-ip 替换为实际公网 IP 或域名。
 sudo rm -f /etc/nginx/sites-enabled/default
 sudo ln -sfn /etc/nginx/sites-available/image2-gen /etc/nginx/sites-enabled/image2-gen
 sudo nginx -t
 sudo systemctl daemon-reload
-sudo systemctl enable --now image2-gen.service image2-gen-cleanup.timer nginx.service
-sudo systemctl status image2-gen.service --no-pager
+sudo systemctl enable --now image2-gen.service image2-gen-gateway.service image2-gen-cleanup.timer nginx.service
+sudo systemctl status image2-gen.service image2-gen-gateway.service --no-pager
 curl --fail http://127.0.0.1:8012/health
+curl --fail http://127.0.0.1:4000/health/liveliness
+sudo ss -lnt | awk '$4 ~ /:(8012|4000|55432)$/ {print $4}'
 sudo ufw allow 80/tcp
 sudo ufw status
 ```
 
-检查 `/health` 返回的 `api_key_configured`、`service_auth_enabled`、`upscale_worker_auth_configured` 都为 `true`；否则不要开放公网端口，先修正服务器环境变量。健康检查响应不会返回任何令牌内容。
+检查 `/health` 返回的 `api_key_configured`、`service_auth_enabled`、`service_auth_required`、`upscale_worker_auth_configured` 都为 `true`；否则不要开放公网端口，先修正服务器环境变量。仓库模板中的秘密值故意留空，复制后未填写会失败关闭；形如 `<set-with-...>` 的占位令牌也会被代码识别为未配置。健康检查响应不会返回任何令牌内容。上面的三个私有端口必须都只显示 `127.0.0.1` 或 `[::1]`；不要运行会展开私有 Bearer snippet 的 `nginx -T`，配置校验只使用 `nginx -t`。
 
 systemd 服务退出或崩溃后 5 秒自动重启，并设置 `MemoryHigh=450M`（软限速）、`MemoryMax=500M`（硬上限），避免并发出图在小内存云主机上挤占系统。图片下载、落盘和 worker 上传都按块流式处理，不把一批大图同时保存在内存。清理 timer 每天约 03:30 运行，删除超过 7 天且状态为 `done`/`failed` 的数据库记录、原图和成品图；正在排队、生成或超分的任务不会删除。可用以下命令检查：
+
+清理按整个 batch 的最终完成时间执行：只有同批所有任务都已终态且最新一张也超过保留期时才整批删除，避免破坏幂等重放的张数完整性。`systemctl reload image2-gen-gateway` 会强制重建 LiteLLM 容器，确保 bind mount 的 hook/config 真正重新加载；停止网关容器时保留 930 秒宽限，后端服务保留 1020 秒，不能使用 Docker 默认约 10 秒的停止窗口截断同步请求。
 
 ```bash
 systemctl list-timers image2-gen-cleanup.timer

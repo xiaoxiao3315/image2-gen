@@ -11,7 +11,11 @@ import requests
 from PIL import Image
 
 import image_pipeline.generator as generator_module
-from image_pipeline.generator import GptImageGenerator, ImageGenerationError
+from image_pipeline.generator import (
+    GptImageGenerator,
+    ImageGenerationError,
+    NativeBatchIncomplete,
+)
 
 
 class FakeResponse:
@@ -45,6 +49,26 @@ def _png_payload() -> dict[str, Any]:
     return {"data": [{"b64_json": base64.b64encode(buffer.getvalue()).decode()}]}
 
 
+def test_http_200_short_native_batch_preserves_partial_results(tmp_path: Path) -> None:
+    generator, session = _generator([FakeResponse(200, _png_payload())])
+
+    with pytest.raises(NativeBatchIncomplete) as caught:
+        generator.generate_many(
+            "test prompt",
+            "low",
+            tmp_path,
+            n=3,
+            idempotency_key="partial-request-001",
+        )
+
+    assert caught.value.requested_count == 3
+    assert len(caught.value.partial_results) == 1
+    partial = caught.value.partial_results[0]
+    assert Path(partial.image.path).is_file()
+    assert (partial.image.width, partial.image.height) == (7, 5)
+    assert session.calls[0]["headers"]["Idempotency-Key"] == "partial-request-001"
+
+
 def _generator(outcomes: list[FakeResponse | Exception]) -> tuple[GptImageGenerator, SequenceSession]:
     settings = SimpleNamespace(
         api_proxy=None,
@@ -71,7 +95,9 @@ def test_retries_503_with_exponential_backoff_and_stable_idempotency_key(
         [FakeResponse(503), FakeResponse(503), FakeResponse(200, _png_payload())]
     )
 
-    result = generator.generate("test prompt", "low", tmp_path)
+    result = generator.generate(
+        "test prompt", "low", tmp_path, idempotency_key="stable-request-001"
+    )
 
     assert len(session.calls) == 3
     assert sleeps == [1.0, 2.0]
@@ -79,7 +105,7 @@ def test_retries_503_with_exponential_backoff_and_stable_idempotency_key(
     idempotency_keys = {
         call["headers"]["Idempotency-Key"] for call in session.calls
     }
-    assert len(idempotency_keys) == 1
+    assert idempotency_keys == {"stable-request-001"}
     assert (result.image.width, result.image.height) == (7, 5)
 
 
@@ -148,7 +174,7 @@ def test_retry_attempt_setting_rejects_unsafe_values(
     monkeypatch.setenv("IMAGE_API_MAX_ATTEMPTS", "20")
     generator, session = _generator([])
 
-    with pytest.raises(ValueError, match="from 1 to 5"):
+    with pytest.raises(ValueError, match="from 1 to 3"):
         generator.generate("test prompt", "low", tmp_path)
 
     assert session.calls == []

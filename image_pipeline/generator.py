@@ -24,8 +24,22 @@ class NativeBatchUnsupported(ImageGenerationError):
     """The provider explicitly rejected image generation with n > 1."""
 
 
+class NativeBatchIncomplete(ImageGenerationError):
+    """HTTP 200 returned some, but fewer than the requested native batch."""
+
+    def __init__(
+        self,
+        message: str,
+        partial_results: list[GenerationResult],
+        requested_count: int,
+    ) -> None:
+        super().__init__(message)
+        self.partial_results = partial_results
+        self.requested_count = requested_count
+
+
 DEFAULT_API_MAX_ATTEMPTS = 3
-MAX_API_MAX_ATTEMPTS = 5
+MAX_API_MAX_ATTEMPTS = 3
 API_RETRY_BASE_SECONDS = 1.0
 
 
@@ -34,9 +48,9 @@ def _api_max_attempts() -> int:
     try:
         attempts = int(raw)
     except ValueError as exc:
-        raise ValueError("IMAGE_API_MAX_ATTEMPTS must be an integer from 1 to 5") from exc
+        raise ValueError("IMAGE_API_MAX_ATTEMPTS must be an integer from 1 to 3") from exc
     if not 1 <= attempts <= MAX_API_MAX_ATTEMPTS:
-        raise ValueError("IMAGE_API_MAX_ATTEMPTS must be an integer from 1 to 5")
+        raise ValueError("IMAGE_API_MAX_ATTEMPTS must be an integer from 1 to 3")
     return attempts
 
 
@@ -133,11 +147,28 @@ class GptImageGenerator:
                 {"http": settings.api_proxy, "https": settings.api_proxy}
             )
 
-    def generate(self, prompt: str, quality: str, output_dir: Path) -> GenerationResult:
-        return self.generate_many(prompt, quality, output_dir, n=1)[0]
+    def generate(
+        self,
+        prompt: str,
+        quality: str,
+        output_dir: Path,
+        idempotency_key: str | None = None,
+    ) -> GenerationResult:
+        return self.generate_many(
+            prompt,
+            quality,
+            output_dir,
+            n=1,
+            idempotency_key=idempotency_key,
+        )[0]
 
     def generate_many(
-        self, prompt: str, quality: str, output_dir: Path, n: int
+        self,
+        prompt: str,
+        quality: str,
+        output_dir: Path,
+        n: int,
+        idempotency_key: str | None = None,
     ) -> list[GenerationResult]:
         if quality not in TIERS:
             raise ValueError(f"quality must be one of {', '.join(TIERS)}")
@@ -145,6 +176,10 @@ class GptImageGenerator:
             raise ValueError("prompt must not be empty")
         if not 1 <= n <= 5:
             raise ValueError("n must be an integer from 1 to 5")
+        if idempotency_key is not None and not re.fullmatch(
+            r"[A-Za-z0-9_.:-]{8,200}", idempotency_key
+        ):
+            raise ValueError("idempotency_key must be 8-200 safe ASCII characters")
         output_dir.mkdir(parents=True, exist_ok=True)
 
         request_body = {
@@ -160,7 +195,7 @@ class GptImageGenerator:
             # Reuse this value for every retry of this logical generation request.
             # This is the primary safeguard against duplicate work/billing when a
             # timeout leaves the provider-side outcome unknown.
-            "Idempotency-Key": uuid.uuid4().hex,
+            "Idempotency-Key": idempotency_key or uuid.uuid4().hex,
         }
         endpoint = f"{self.settings.api_base_url}/images/generations"
 
@@ -226,8 +261,10 @@ class GptImageGenerator:
         for index in range(n):
             candidate = _pop_image(payload)
             if candidate is None:
-                raise ImageGenerationError(
-                    f"Image API HTTP 200 response contained fewer than {n} images"
+                raise NativeBatchIncomplete(
+                    f"Image API HTTP 200 response contained only {len(results)} of {n} images",
+                    partial_results=results,
+                    requested_count=n,
                 )
             kind, value, trail = candidate
             download_started = time.perf_counter()

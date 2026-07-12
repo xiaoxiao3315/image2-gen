@@ -1,0 +1,88 @@
+services:
+  postgres:
+    image: postgres:16.14-alpine3.24@sha256:7a396fd264a2067788b6551122b50f162bf6136312c7fc9d74381cb92c648382
+    platform: linux/amd64
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: litellm
+      POSTGRES_USER: litellm
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    command:
+      - postgres
+      - -c
+      - shared_buffers=64MB
+      - -c
+      - work_mem=2MB
+      - -c
+      - max_connections=100
+    ports:
+      - 127.0.0.1:55432:5432
+    volumes:
+      - litellm_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U litellm -d litellm]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    mem_limit: 256m
+    mem_reservation: 128m
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+  litellm:
+    image: ghcr.io/berriai/litellm-database:v1.91.2@sha256:64696cd89e425c2b2d0e0c78cece7d52430185ef155a5b0a67557ab9a226af9b
+    platform: linux/amd64
+    restart: unless-stopped
+    network_mode: host
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL}
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?set LITELLM_MASTER_KEY}
+      LITELLM_SALT_KEY: ${LITELLM_SALT_KEY:?set LITELLM_SALT_KEY}
+      IMAGE_LITELLM_BACKEND_TOKEN: ${IMAGE_LITELLM_BACKEND_TOKEN:?set IMAGE_LITELLM_BACKEND_TOKEN}
+      IMAGE_COST_USD_PER_IMAGE: ${IMAGE_COST_USD_PER_IMAGE:?set IMAGE_COST_USD_PER_IMAGE}
+      PYTHONPATH: /opt/image2-gen
+    volumes:
+      - ../..:/opt/image2-gen:ro
+      - ./config.yaml:/app/config.yaml:ro
+      - ../../gateway:/app/gateway:ro
+    command:
+      - --config
+      - /app/config.yaml
+      - --host
+      - 127.0.0.1
+      - --port
+      - "4000"
+      - --num_workers
+      - "1"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:4000/health/liveliness', timeout=3)
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    mem_limit: 1600m
+    mem_reservation: 768m
+    stop_grace_period: 930s
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+volumes:
+  litellm_postgres_data:

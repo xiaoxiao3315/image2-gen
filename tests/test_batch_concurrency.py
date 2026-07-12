@@ -15,7 +15,11 @@ from PIL import Image
 from pydantic import ValidationError
 
 import image_pipeline.service as service
-from image_pipeline.generator import GptImageGenerator, NativeBatchUnsupported
+from image_pipeline.generator import (
+    GptImageGenerator,
+    NativeBatchIncomplete,
+    NativeBatchUnsupported,
+)
 from image_pipeline.models import GenerationResult
 
 
@@ -56,25 +60,126 @@ def test_generation_worker_default_and_hard_limit(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.delenv("IMAGE_GENERATION_WORKERS", raising=False)
+    monkeypatch.delenv("IMAGE_GENERATION_MAX_WORKERS", raising=False)
+    monkeypatch.delenv("IMAGE_GENERATION_MIN_WORKERS", raising=False)
     manager = service.TaskManager(
         service.TaskStore(tmp_path / "default.db"),
         source_dir=tmp_path / "sources-default",
     )
     assert manager.worker_count == 3
+    assert manager.generation_limiter.capacity == 8
 
-    monkeypatch.setenv("IMAGE_GENERATION_WORKERS", "5")
+    monkeypatch.setenv("IMAGE_GENERATION_WORKERS", "8")
     manager = service.TaskManager(
-        service.TaskStore(tmp_path / "five.db"),
-        source_dir=tmp_path / "sources-five",
+        service.TaskStore(tmp_path / "eight.db"),
+        source_dir=tmp_path / "sources-eight",
     )
-    assert manager.worker_count == 5
+    assert manager.worker_count == 8
 
-    monkeypatch.setenv("IMAGE_GENERATION_WORKERS", "6")
-    with pytest.raises(RuntimeError, match="from 1 to 5"):
+    monkeypatch.setenv("IMAGE_GENERATION_WORKERS", "9")
+    with pytest.raises(RuntimeError, match="from 1 to 8"):
         service.TaskManager(
             service.TaskStore(tmp_path / "too-many.db"),
             source_dir=tmp_path / "sources-too-many",
         )
+
+
+def test_native_five_image_batch_works_with_default_three_worker_ceiling(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("IMAGE_API_KEY", "unit-test-key")
+    monkeypatch.setenv("IMAGE_API_BASE_URL", "https://example.test/v1")
+    monkeypatch.delenv("IMAGE_GENERATION_WORKERS", raising=False)
+    monkeypatch.delenv("IMAGE_GENERATION_MAX_WORKERS", raising=False)
+    monkeypatch.delenv("IMAGE_GENERATION_MIN_WORKERS", raising=False)
+
+    class FakeGenerator:
+        def generate_many(
+            self,
+            _prompt: str,
+            quality: str,
+            output_dir: Path,
+            n: int,
+            **_kwargs: Any,
+        ) -> list[GenerationResult]:
+            output_dir.mkdir(parents=True)
+            results = []
+            for index in range(n):
+                path = output_dir / f"source-{index}.png"
+                path.write_bytes(_png_bytes(color="purple"))
+                results.append(_result(path, quality))
+            return results
+
+    store = service.TaskStore(tmp_path / "native-five.db")
+    manager = service.TaskManager(
+        store,
+        source_dir=tmp_path / "sources-native-five",
+        generator_factory=lambda _: FakeGenerator(),
+    )
+    manager.start()
+    tasks = manager.submit_batch("p", "2k", count=5, requested_concurrency=5)
+    manager.queue.join()
+    manager.stop()
+
+    assert manager.generation_limiter.peak == 5
+    assert all((store.get(task["task_id"]) or {})["status"] == "awaiting_upscale" for task in tasks)
+
+
+def test_generation_workers_scale_out_for_backlog_and_retire_when_idle(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("IMAGE_API_KEY", "unit-test-key")
+    monkeypatch.setenv("IMAGE_API_BASE_URL", "https://example.test/v1")
+    monkeypatch.setenv("IMAGE_GENERATION_MIN_WORKERS", "1")
+    monkeypatch.setenv("IMAGE_GENERATION_MAX_WORKERS", "4")
+    monkeypatch.setenv("IMAGE_GENERATION_IDLE_RETIRE_SECONDS", "1")
+    monkeypatch.delenv("IMAGE_GENERATION_WORKERS", raising=False)
+    active = 0
+    peak = 0
+    lock = threading.Lock()
+
+    class SlowGenerator:
+        def generate(
+            self, _prompt: str, quality: str, output_dir: Path, **_kwargs: Any
+        ) -> GenerationResult:
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            try:
+                time.sleep(0.2)
+                output_dir.mkdir(parents=True)
+                path = output_dir / "source.png"
+                path.write_bytes(_png_bytes(color="orange"))
+                return _result(path, quality)
+            finally:
+                with lock:
+                    active -= 1
+
+    def wait_for(predicate: Any, timeout: float = 4.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.02)
+        return False
+
+    store = service.TaskStore(tmp_path / "elastic.db")
+    manager = service.TaskManager(
+        store,
+        source_dir=tmp_path / "sources-elastic",
+        generator_factory=lambda _: SlowGenerator(),
+    )
+    manager.start()
+    tasks = [manager.submit(f"p-{index}", "2k") for index in range(4)]
+
+    assert wait_for(lambda: manager.active_worker_count == 4)
+    manager.queue.join()
+    assert peak == 4
+    assert wait_for(lambda: manager.active_worker_count == 1, timeout=4.0)
+    manager.stop()
+
+    assert all((store.get(task["task_id"]) or {})["status"] == "awaiting_upscale" for task in tasks)
 
 
 def test_single_request_compatibility_and_batch_response(
@@ -216,7 +321,9 @@ def test_unsupported_native_batch_falls_back_with_requested_concurrency(
         def generate_many(self, *_args: Any, **_kwargs: Any) -> list[GenerationResult]:
             raise NativeBatchUnsupported("n unsupported")
 
-        def generate(self, _prompt: str, quality: str, output_dir: Path) -> GenerationResult:
+        def generate(
+            self, _prompt: str, quality: str, output_dir: Path, **_kwargs: Any
+        ) -> GenerationResult:
             nonlocal active, peak
             with lock:
                 active += 1
@@ -253,6 +360,135 @@ def test_unsupported_native_batch_falls_back_with_requested_concurrency(
     } == {"single_fallback"}
 
 
+def test_partial_native_batch_is_salvaged_and_only_remainder_is_generated(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("IMAGE_API_KEY", "unit-test-key")
+    monkeypatch.setenv("IMAGE_API_BASE_URL", "https://example.test/v1")
+    monkeypatch.setenv("IMAGE_GENERATION_WORKERS", "3")
+    fallback_keys: list[str] = []
+
+    class PartialGenerator:
+        def generate_many(
+            self,
+            _prompt: str,
+            quality: str,
+            output_dir: Path,
+            n: int,
+            **_kwargs: Any,
+        ) -> list[GenerationResult]:
+            assert n == 3
+            output_dir.mkdir(parents=True)
+            path = output_dir / "source-1.png"
+            path.write_bytes(_png_bytes(color="red"))
+            raise NativeBatchIncomplete(
+                "provider returned one image",
+                partial_results=[_result(path, quality)],
+                requested_count=n,
+            )
+
+        def generate(
+            self,
+            _prompt: str,
+            quality: str,
+            output_dir: Path,
+            idempotency_key: str | None = None,
+        ) -> GenerationResult:
+            assert idempotency_key is not None
+            fallback_keys.append(idempotency_key)
+            output_dir.mkdir(parents=True)
+            path = output_dir / "source.png"
+            path.write_bytes(_png_bytes(color="blue"))
+            return _result(path, quality)
+
+    store = service.TaskStore(tmp_path / "partial.db")
+    manager = service.TaskManager(
+        store,
+        source_dir=tmp_path / "sources-partial",
+        generator_factory=lambda _: PartialGenerator(),
+    )
+    manager.start()
+    tasks = manager.submit_batch("p", "2k", count=3, requested_concurrency=3)
+    manager.queue.join()
+    manager.stop()
+
+    rows = [store.get(task["task_id"]) for task in tasks]
+    assert all(row and row["status"] == "awaiting_upscale" for row in rows)
+    assert json.loads(rows[0]["metrics_json"])["generation_mode"] == "native_n_partial"
+    assert {
+        json.loads(row["metrics_json"])["generation_mode"] for row in rows[1:]
+    } == {"single_fallback"}
+    assert set(fallback_keys) == {
+        str(row["generation_idempotency_key"]) for row in rows[1:]
+    }
+    assert str(rows[0]["generation_idempotency_key"]) not in fallback_keys
+
+
+def test_partial_native_probe_is_single_flight_and_later_batches_skip_native(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("IMAGE_API_KEY", "unit-test-key")
+    monkeypatch.setenv("IMAGE_API_BASE_URL", "https://example.test/v1")
+    monkeypatch.setenv("IMAGE_GENERATION_MIN_WORKERS", "2")
+    monkeypatch.setenv("IMAGE_GENERATION_MAX_WORKERS", "2")
+    monkeypatch.delenv("IMAGE_GENERATION_WORKERS", raising=False)
+    probe_started = threading.Event()
+    release_probe = threading.Event()
+    native_calls = 0
+    calls_lock = threading.Lock()
+
+    class ProbeGenerator:
+        def generate_many(
+            self,
+            _prompt: str,
+            quality: str,
+            output_dir: Path,
+            n: int,
+            **_kwargs: Any,
+        ) -> list[GenerationResult]:
+            nonlocal native_calls
+            with calls_lock:
+                native_calls += 1
+            probe_started.set()
+            assert release_probe.wait(timeout=2)
+            output_dir.mkdir(parents=True)
+            path = output_dir / "source-1.png"
+            path.write_bytes(_png_bytes(color="yellow"))
+            raise NativeBatchIncomplete(
+                "provider ignored n",
+                partial_results=[_result(path, quality)],
+                requested_count=n,
+            )
+
+        def generate(
+            self, _prompt: str, quality: str, output_dir: Path, **_kwargs: Any
+        ) -> GenerationResult:
+            output_dir.mkdir(parents=True)
+            path = output_dir / "source.png"
+            path.write_bytes(_png_bytes(color="green"))
+            return _result(path, quality)
+
+    store = service.TaskStore(tmp_path / "single-flight.db")
+    manager = service.TaskManager(
+        store,
+        source_dir=tmp_path / "sources-single-flight",
+        generator_factory=lambda _: ProbeGenerator(),
+    )
+    manager.start()
+    first = manager.submit_batch("p1", "2k", count=2, requested_concurrency=2)
+    assert probe_started.wait(timeout=2)
+    second = manager.submit_batch("p2", "2k", count=2, requested_concurrency=2)
+    release_probe.set()
+    manager.queue.join()
+    third = manager.submit_batch("p3", "2k", count=2, requested_concurrency=2)
+    manager.queue.join()
+    manager.stop()
+
+    assert native_calls == 1
+    for task in first + second + third:
+        assert (store.get(task["task_id"]) or {})["status"] == "awaiting_upscale"
+
+
 def test_fallback_cannot_exceed_configured_generation_workers(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -267,7 +503,9 @@ def test_fallback_cannot_exceed_configured_generation_workers(
         def generate_many(self, *_args: Any, **_kwargs: Any) -> list[GenerationResult]:
             raise NativeBatchUnsupported("n unsupported")
 
-        def generate(self, _prompt: str, quality: str, output_dir: Path) -> GenerationResult:
+        def generate(
+            self, _prompt: str, quality: str, output_dir: Path, **_kwargs: Any
+        ) -> GenerationResult:
             nonlocal active, peak
             with lock:
                 active += 1
@@ -307,7 +545,12 @@ def test_native_batches_share_global_five_slot_limit(
 
     class FakeGenerator:
         def generate_many(
-            self, _prompt: str, quality: str, output_dir: Path, n: int
+            self,
+            _prompt: str,
+            quality: str,
+            output_dir: Path,
+            n: int,
+            **_kwargs: Any,
         ) -> list[GenerationResult]:
             nonlocal active_weight, observed_peak
             with lock:
@@ -346,3 +589,94 @@ def test_native_batches_share_global_five_slot_limit(
         row = store.get(task["task_id"])
         assert row and row["status"] == "awaiting_upscale"
         assert json.loads(row["metrics_json"])["generation_mode"] == "native_n"
+
+
+def test_restart_reuses_persisted_upstream_idempotency_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("IMAGE_API_KEY", "unit-test-key")
+    monkeypatch.setenv("IMAGE_API_BASE_URL", "https://example.test/v1")
+    database = tmp_path / "restart.db"
+    first_store = service.TaskStore(database)
+    task = first_store.create("p", "2k")
+    before = first_store.get(task["task_id"])
+    assert before and len(before["generation_idempotency_key"]) == 32
+    first_store.update(task["task_id"], status="processing")
+
+    captured: list[str] = []
+
+    class CapturingGenerator:
+        def generate(
+            self,
+            _prompt: str,
+            quality: str,
+            output_dir: Path,
+            idempotency_key: str | None = None,
+        ) -> GenerationResult:
+            assert idempotency_key is not None
+            captured.append(idempotency_key)
+            output_dir.mkdir(parents=True)
+            path = output_dir / "source.png"
+            path.write_bytes(_png_bytes(color="teal"))
+            return _result(path, quality)
+
+    restarted_store = service.TaskStore(database)
+    restored = restarted_store.get(task["task_id"])
+    assert restored and restored["status"] == "queued"
+    assert restored["generation_idempotency_key"] == before["generation_idempotency_key"]
+    manager = service.TaskManager(
+        restarted_store,
+        source_dir=tmp_path / "sources-restart",
+        generator_factory=lambda _: CapturingGenerator(),
+    )
+    manager.start()
+    manager.queue.join()
+    manager.stop()
+
+    assert captured == [before["generation_idempotency_key"]]
+    assert (restarted_store.get(task["task_id"]) or {})["status"] == "awaiting_upscale"
+
+
+def test_stop_drains_busy_generation_without_corrupting_worker_state(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("IMAGE_API_KEY", "unit-test-key")
+    monkeypatch.setenv("IMAGE_API_BASE_URL", "https://example.test/v1")
+    monkeypatch.setenv("IMAGE_GENERATION_MIN_WORKERS", "1")
+    monkeypatch.setenv("IMAGE_GENERATION_MAX_WORKERS", "1")
+    monkeypatch.setenv("IMAGE_GENERATION_SHUTDOWN_TIMEOUT_SECONDS", "2")
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingGenerator:
+        def generate(
+            self,
+            _prompt: str,
+            quality: str,
+            output_dir: Path,
+            **_kwargs: Any,
+        ) -> GenerationResult:
+            started.set()
+            assert release.wait(timeout=2)
+            output_dir.mkdir(parents=True)
+            path = output_dir / "source.png"
+            path.write_bytes(_png_bytes(color="black"))
+            return _result(path, quality)
+
+    manager = service.TaskManager(
+        service.TaskStore(tmp_path / "drain.db"),
+        source_dir=tmp_path / "sources-drain",
+        generator_factory=lambda _: BlockingGenerator(),
+    )
+    manager.start()
+    manager.submit("p", "2k")
+    assert started.wait(timeout=2)
+    releaser = threading.Timer(0.15, release.set)
+    releaser.start()
+    stop_started = time.monotonic()
+    manager.stop()
+    releaser.join()
+
+    assert time.monotonic() - stop_started >= 0.1
+    assert manager.active_worker_count == 0
+    assert manager.busy_worker_count == 0

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import math
 import os
@@ -34,7 +36,11 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import AliasChoices, BaseModel, Field, field_validator
 
 from .config import PROJECT_ROOT, Settings
-from .generator import GptImageGenerator, NativeBatchUnsupported
+from .generator import (
+    GptImageGenerator,
+    NativeBatchIncomplete,
+    NativeBatchUnsupported,
+)
 from .image_io import inspect_image
 
 
@@ -51,15 +57,17 @@ DEFAULT_LEASE_SECONDS = 15 * 60
 DEFAULT_UPSCALE_MAX_ATTEMPTS = 3
 DEFAULT_MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 UPLOAD_CHUNK_BYTES = 1024 * 1024
-MAX_GENERATION_CONCURRENCY = 5
-DEFAULT_GENERATION_WORKERS = 3
+MAX_BATCH_SIZE = 5
+MAX_GENERATION_CONCURRENCY = 8
+DEFAULT_GENERATION_MIN_WORKERS = 1
+DEFAULT_GENERATION_MAX_WORKERS = 3
 
 
 class GenerateTaskRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=32000)
     size: str = Field(default="4k", validation_alias=AliasChoices("size", "target"))
-    count: int = Field(default=1, ge=1, le=MAX_GENERATION_CONCURRENCY)
-    concurrency: int = Field(default=3, ge=1, le=MAX_GENERATION_CONCURRENCY)
+    count: int = Field(default=1, ge=1, le=MAX_BATCH_SIZE)
+    concurrency: int = Field(default=3, ge=1, le=MAX_BATCH_SIZE)
 
     @field_validator("size")
     @classmethod
@@ -74,6 +82,31 @@ class GenerateTaskRequest(BaseModel):
         if normalized not in aliases:
             raise ValueError("size must be 2k/2048x2048 or 4k/3840x2160")
         return aliases[normalized]
+
+
+class OpenAIImageGenerationRequest(BaseModel):
+    model: str
+    prompt: str = Field(min_length=1, max_length=4000)
+    n: int = Field(default=1, ge=1, le=MAX_BATCH_SIZE)
+    size: str = Field(default="2048x2048")
+    response_format: str = "url"
+    user: str = Field(min_length=8, max_length=128)
+
+    @field_validator("size")
+    @classmethod
+    def normalize_size(cls, value: str) -> str:
+        return GenerateTaskRequest.normalize_size(value)
+
+    @field_validator("response_format")
+    @classmethod
+    def require_url_response(cls, value: str) -> str:
+        if value != "url":
+            raise ValueError("response_format must be url")
+        return value
+
+
+class IdempotencyConflict(RuntimeError):
+    pass
 
 
 def _utc_iso(timestamp: float | None = None) -> str:
@@ -111,7 +144,7 @@ def _bounded_int_env(name: str, default: int, maximum: int) -> int:
 
 
 class WeightedLimiter:
-    """A process-wide weighted semaphore with an observable peak for tests/health."""
+    """A weighted semaphore with observable usage for tests and health checks."""
 
     def __init__(self, capacity: int):
         self.capacity = capacity
@@ -187,6 +220,7 @@ class TaskStore:
         "claimed_by": "TEXT",
         "lease_heartbeat_at": "REAL",
         "upscale_attempts": "INTEGER",
+        "generation_idempotency_key": "TEXT",
     }
 
     def __init__(self, path: Path):
@@ -245,6 +279,10 @@ class TaskStore:
             connection.execute(
                 "UPDATE tasks SET upscale_attempts=0 WHERE upscale_attempts IS NULL"
             )
+            connection.execute(
+                "UPDATE tasks SET generation_idempotency_key=lower(hex(randomblob(16))) "
+                "WHERE generation_idempotency_key IS NULL OR generation_idempotency_key=''"
+            )
             # Generation calls interrupted by a process restart are safe to enqueue again;
             # an active GPU claim is only recovered after its lease expires.
             connection.execute(
@@ -276,6 +314,18 @@ class TaskStore:
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS api_idempotency (
+                    tenant_scope_hash TEXT NOT NULL,
+                    idempotency_key_hash TEXT NOT NULL,
+                    request_hash TEXT NOT NULL,
+                    batch_id TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    PRIMARY KEY(tenant_scope_hash, idempotency_key_hash)
+                )
+                """
+            )
 
     def create(self, prompt: str, size: str) -> dict[str, Any]:
         return self.create_batch(prompt, size, count=1, requested_concurrency=1)[0]
@@ -283,11 +333,11 @@ class TaskStore:
     def create_batch(
         self, prompt: str, size: str, count: int, requested_concurrency: int
     ) -> list[dict[str, Any]]:
-        if not 1 <= count <= MAX_GENERATION_CONCURRENCY:
-            raise ValueError(f"count must be from 1 to {MAX_GENERATION_CONCURRENCY}")
-        if not 1 <= requested_concurrency <= MAX_GENERATION_CONCURRENCY:
+        if not 1 <= count <= MAX_BATCH_SIZE:
+            raise ValueError(f"count must be from 1 to {MAX_BATCH_SIZE}")
+        if not 1 <= requested_concurrency <= MAX_BATCH_SIZE:
             raise ValueError(
-                f"requested_concurrency must be from 1 to {MAX_GENERATION_CONCURRENCY}"
+                f"requested_concurrency must be from 1 to {MAX_BATCH_SIZE}"
             )
         batch_id = uuid.uuid4().hex
         created_at = time.time()
@@ -298,6 +348,7 @@ class TaskStore:
                 "batch_index": index,
                 "batch_size": count,
                 "requested_concurrency": requested_concurrency,
+                "generation_idempotency_key": uuid.uuid4().hex,
                 "status": "queued",
                 "created_at": created_at,
             }
@@ -306,7 +357,8 @@ class TaskStore:
         with self.connect() as connection:
             connection.executemany(
                 "INSERT INTO tasks(task_id,prompt,size,status,created_at,batch_id,batch_index,"
-                "batch_size,requested_concurrency) VALUES(?,?,?,?,?,?,?,?,?)",
+                "batch_size,requested_concurrency,generation_idempotency_key) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
                 [
                     (
                         record["task_id"],
@@ -318,11 +370,121 @@ class TaskStore:
                         record["batch_index"],
                         count,
                         requested_concurrency,
+                        record["generation_idempotency_key"],
                     )
                     for record in records
                 ],
             )
         return records
+
+    def create_batch_idempotent(
+        self,
+        prompt: str,
+        size: str,
+        count: int,
+        requested_concurrency: int,
+        tenant_scope: str,
+        idempotency_key: str,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        if not 1 <= count <= MAX_BATCH_SIZE:
+            raise ValueError(f"count must be from 1 to {MAX_BATCH_SIZE}")
+        if not 1 <= requested_concurrency <= MAX_BATCH_SIZE:
+            raise ValueError(f"requested_concurrency must be from 1 to {MAX_BATCH_SIZE}")
+        tenant_hash = hashlib.sha256(tenant_scope.encode("utf-8")).hexdigest()
+        key_hash = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
+        request_hash = hashlib.sha256(
+            json.dumps(
+                {
+                    "prompt": prompt,
+                    "size": size,
+                    "count": count,
+                    "concurrency": requested_concurrency,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT request_hash,batch_id FROM api_idempotency "
+                "WHERE tenant_scope_hash=? AND idempotency_key_hash=?",
+                (tenant_hash, key_hash),
+            ).fetchone()
+            if existing is not None:
+                if not secrets.compare_digest(str(existing["request_hash"]), request_hash):
+                    connection.rollback()
+                    raise IdempotencyConflict(
+                        "idempotency key was already used with a different request"
+                    )
+                rows = connection.execute(
+                    "SELECT * FROM tasks WHERE batch_id=? ORDER BY batch_index",
+                    (existing["batch_id"],),
+                ).fetchall()
+                if rows:
+                    indexes = [int(row["batch_index"]) for row in rows]
+                    if len(rows) != count or indexes != list(range(count)):
+                        connection.rollback()
+                        raise IdempotencyConflict(
+                            "idempotent batch ledger is incomplete; refusing unsafe replay"
+                        )
+                    connection.commit()
+                    return [dict(row) for row in rows], True
+                # Retention cleanup may have deleted every task in this batch.
+                # Remove the orphaned ledger row and recreate the logical request
+                # atomically instead of returning reused=True with an empty batch.
+                connection.execute(
+                    "DELETE FROM api_idempotency "
+                    "WHERE tenant_scope_hash=? AND idempotency_key_hash=?",
+                    (tenant_hash, key_hash),
+                )
+
+            batch_id = uuid.uuid4().hex
+            created_at = time.time()
+            records = [
+                {
+                    "task_id": uuid.uuid4().hex,
+                    "batch_id": batch_id,
+                    "batch_index": index,
+                    "batch_size": count,
+                    "requested_concurrency": requested_concurrency,
+                    "generation_idempotency_key": uuid.uuid4().hex,
+                    "status": "queued",
+                    "created_at": created_at,
+                }
+                for index in range(count)
+            ]
+            connection.executemany(
+                "INSERT INTO tasks(task_id,prompt,size,status,created_at,batch_id,batch_index,"
+                "batch_size,requested_concurrency,generation_idempotency_key) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                [
+                    (
+                        record["task_id"],
+                        prompt,
+                        size,
+                        "queued",
+                        created_at,
+                        batch_id,
+                        record["batch_index"],
+                        count,
+                        requested_concurrency,
+                        record["generation_idempotency_key"],
+                    )
+                    for record in records
+                ],
+            )
+            connection.execute(
+                "INSERT INTO api_idempotency(tenant_scope_hash,idempotency_key_hash,"
+                "request_hash,batch_id,created_at) VALUES(?,?,?,?,?)",
+                (tenant_hash, key_hash, request_hash, batch_id, created_at),
+            )
+            connection.commit()
+            return records, False
+        finally:
+            connection.close()
 
     def get(self, task_id: str) -> dict[str, Any] | None:
         with self.connect() as connection:
@@ -356,6 +518,43 @@ class TaskStore:
         with self.connect() as connection:
             rows = connection.execute("SELECT status,COUNT(*) FROM tasks GROUP BY status").fetchall()
         return {str(row[0]): int(row[1]) for row in rows}
+
+    def operational_stats(self, now: float | None = None) -> dict[str, Any]:
+        from datetime import datetime, timezone
+
+        now = time.time() if now is None else now
+        current = datetime.fromtimestamp(now, tz=timezone.utc)
+        day_start = current.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        with self.connect() as connection:
+            status_rows = connection.execute(
+                "SELECT status,COUNT(*) AS count FROM tasks GROUP BY status"
+            ).fetchall()
+            today = connection.execute(
+                "SELECT "
+                "SUM(CASE WHEN status='done' THEN 1 ELSE 0 END) AS done_count,"
+                "SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed_count,"
+                "AVG(CASE WHEN status='done' THEN completed_at-created_at END) AS avg_seconds "
+                "FROM tasks WHERE completed_at>=?",
+                (day_start,),
+            ).fetchone()
+        counts = {str(row["status"]): int(row["count"]) for row in status_rows}
+        done = int(today["done_count"] or 0)
+        failed = int(today["failed_count"] or 0)
+        terminal = done + failed
+        return {
+            "queue_length": counts.get("queued", 0),
+            "generating": counts.get("processing", 0),
+            "awaiting_upscale": counts.get("awaiting_upscale", 0),
+            "upscaling": counts.get("upscaling", 0),
+            "done_total": counts.get("done", 0),
+            "failed_total": counts.get("failed", 0),
+            "today_done": done,
+            "today_failed": failed,
+            "today_success_rate": None if terminal == 0 else round(done / terminal, 6),
+            "today_average_end_to_end_seconds": (
+                None if today["avg_seconds"] is None else round(float(today["avg_seconds"]), 3)
+            ),
+        }
 
     def update(self, task_id: str, **values: Any) -> None:
         if not values:
@@ -575,44 +774,138 @@ class TaskManager:
         store: TaskStore,
         source_dir: Path = SOURCE_IMAGE_DIR,
         generator_factory: GeneratorFactory = GptImageGenerator,
-        generation_limiter: WeightedLimiter = GLOBAL_GENERATION_LIMITER,
+        generation_limiter: WeightedLimiter | None = None,
     ):
         self.store = store
         self.source_dir = source_dir
         self.source_dir.mkdir(parents=True, exist_ok=True)
         self.generator_factory = generator_factory
-        self.generation_limiter = generation_limiter
         self.queue: queue.Queue[str | None] = queue.Queue()
         self.stop_event = threading.Event()
         self.workers: list[threading.Thread] = []
-        self.worker_count = _bounded_int_env(
-            "IMAGE_GENERATION_WORKERS",
-            DEFAULT_GENERATION_WORKERS,
+        self._worker_lock = threading.Lock()
+        self._busy_workers = 0
+        self._worker_sequence = 0
+        self.controller: threading.Thread | None = None
+        self._native_batch_condition = threading.Condition()
+        self._native_batch_supported: bool | None = None
+        self._native_batch_probe_in_progress = False
+        legacy_max = os.getenv("IMAGE_GENERATION_WORKERS", "").strip()
+        default_max = (
+            _bounded_int_env(
+                "IMAGE_GENERATION_WORKERS",
+                DEFAULT_GENERATION_MAX_WORKERS,
+                MAX_GENERATION_CONCURRENCY,
+            )
+            if legacy_max
+            else DEFAULT_GENERATION_MAX_WORKERS
+        )
+        self.max_worker_count = _bounded_int_env(
+            "IMAGE_GENERATION_MAX_WORKERS",
+            default_max,
             MAX_GENERATION_CONCURRENCY,
         )
+        self.min_worker_count = _bounded_int_env(
+            "IMAGE_GENERATION_MIN_WORKERS",
+            DEFAULT_GENERATION_MIN_WORKERS,
+            self.max_worker_count,
+        )
+        self.idle_retire_seconds = _positive_int_env(
+            "IMAGE_GENERATION_IDLE_RETIRE_SECONDS", 30
+        )
+        self.shutdown_timeout_seconds = _positive_int_env(
+            "IMAGE_GENERATION_SHUTDOWN_TIMEOUT_SECONDS", 990
+        )
+        # A worker consumes one queued batch, while a native batch can represent
+        # up to five logical image generations. Keep the elastic worker ceiling
+        # separate from the process-wide logical image concurrency ceiling so a
+        # legal n=5 request still works with the conservative three-worker default.
+        self.generation_limiter = generation_limiter or WeightedLimiter(
+            MAX_GENERATION_CONCURRENCY
+        )
+
+    @property
+    def worker_count(self) -> int:
+        """Compatibility name for the configured generation ceiling."""
+        return self.max_worker_count
+
+    @property
+    def active_worker_count(self) -> int:
+        with self._worker_lock:
+            return sum(worker.is_alive() for worker in self.workers)
+
+    @property
+    def busy_worker_count(self) -> int:
+        with self._worker_lock:
+            return self._busy_workers
+
+    def _start_worker_locked(self) -> None:
+        self._worker_sequence += 1
+        worker = threading.Thread(
+            target=self._worker,
+            name=f"image-generation-worker-{self._worker_sequence}",
+            daemon=True,
+        )
+        self.workers.append(worker)
+        worker.start()
+
+    def _ensure_capacity(self) -> None:
+        if self.stop_event.is_set():
+            return
+        with self._worker_lock:
+            self.workers = [worker for worker in self.workers if worker.is_alive()]
+            active = len(self.workers)
+            outstanding = self.queue.qsize() + self._busy_workers
+            desired = min(
+                self.max_worker_count,
+                max(self.min_worker_count, outstanding),
+            )
+            for _ in range(max(0, desired - active)):
+                self._start_worker_locked()
+
+    def _controller(self) -> None:
+        while not self.stop_event.wait(0.5):
+            self._ensure_capacity()
 
     def start(self) -> None:
-        if self.workers:
+        if self.controller and self.controller.is_alive():
             return
+        with self._worker_lock:
+            if any(worker.is_alive() for worker in self.workers):
+                raise RuntimeError(
+                    "cannot restart generation manager while old workers are still active"
+                )
         self.stop_event.clear()
-        for index in range(self.worker_count):
-            worker = threading.Thread(
-                target=self._worker,
-                name=f"image-generation-worker-{index + 1}",
-                daemon=True,
-            )
-            worker.start()
-            self.workers.append(worker)
         for batch_id in self.store.queued_batch_ids():
             self.queue.put(batch_id)
+        self._ensure_capacity()
+        self.controller = threading.Thread(
+            target=self._controller,
+            name="image-generation-elastic-controller",
+            daemon=True,
+        )
+        self.controller.start()
 
     def stop(self) -> None:
         self.stop_event.set()
-        for _ in self.workers:
+        with self._worker_lock:
+            workers = list(self.workers)
+        for _ in workers:
             self.queue.put(None)
-        for worker in self.workers:
-            worker.join(timeout=5)
-        self.workers.clear()
+        deadline = time.monotonic() + self.shutdown_timeout_seconds
+        for worker in workers:
+            worker.join(timeout=max(0.0, deadline - time.monotonic()))
+        if self.controller:
+            self.controller.join(timeout=max(0.0, deadline - time.monotonic()))
+            self.controller = None
+        with self._worker_lock:
+            self.workers = [worker for worker in self.workers if worker.is_alive()]
+            if not self.workers:
+                self._busy_workers = 0
+                # Queued work remains durable in SQLite. Drop stale in-memory
+                # batch IDs and wake-up sentinels so a same-process test restart
+                # cannot double-enqueue or immediately retire fresh workers.
+                self.queue = queue.Queue()
 
     def submit(self, prompt: str, size: str) -> dict[str, Any]:
         return self.submit_batch(prompt, size, count=1, requested_concurrency=1)[0]
@@ -627,24 +920,91 @@ class TaskManager:
             requested_concurrency=requested_concurrency,
         )
         self.queue.put(records[0]["batch_id"])
+        self._ensure_capacity()
         return records
 
+    def submit_batch_idempotent(
+        self,
+        prompt: str,
+        size: str,
+        count: int,
+        requested_concurrency: int,
+        tenant_scope: str,
+        idempotency_key: str,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        records, reused = self.store.create_batch_idempotent(
+            prompt,
+            size,
+            count,
+            requested_concurrency,
+            tenant_scope,
+            idempotency_key,
+        )
+        if not reused:
+            self.queue.put(records[0]["batch_id"])
+            self._ensure_capacity()
+        return records, reused
+
     def _worker(self) -> None:
-        while not self.stop_event.is_set():
-            batch_id = self.queue.get()
-            if batch_id is None:
-                self.queue.task_done()
-                return
-            try:
-                self._run_batch(batch_id)
-            finally:
-                self.queue.task_done()
+        current = threading.current_thread()
+        try:
+            while not self.stop_event.is_set():
+                try:
+                    batch_id = self.queue.get(timeout=self.idle_retire_seconds)
+                except queue.Empty:
+                    with self._worker_lock:
+                        active = sum(worker.is_alive() for worker in self.workers)
+                    if active > self.min_worker_count and self.queue.empty():
+                        return
+                    continue
+                if batch_id is None:
+                    self.queue.task_done()
+                    return
+                with self._worker_lock:
+                    self._busy_workers += 1
+                try:
+                    self._run_batch(batch_id)
+                finally:
+                    with self._worker_lock:
+                        self._busy_workers -= 1
+                    self.queue.task_done()
+        finally:
+            with self._worker_lock:
+                self.workers = [worker for worker in self.workers if worker is not current]
 
     def _run_task(self, task_id: str) -> None:
         """Compatibility entry point used by older callers and focused tests."""
         task = self.store.get(task_id)
         if task:
             self._run_batch(str(task["batch_id"]))
+
+    def _native_batch_route(self) -> str:
+        """Choose native/fallback while allowing only one initial capability probe."""
+        with self._native_batch_condition:
+            while (
+                self._native_batch_supported is None
+                and self._native_batch_probe_in_progress
+            ):
+                self._native_batch_condition.wait()
+            if self._native_batch_supported is False:
+                return "fallback"
+            if self._native_batch_supported is True:
+                return "native"
+            self._native_batch_probe_in_progress = True
+            return "probe"
+
+    def _finish_native_batch_probe(self, supported: bool | None) -> None:
+        with self._native_batch_condition:
+            if supported is not None:
+                self._native_batch_supported = supported
+            self._native_batch_probe_in_progress = False
+            self._native_batch_condition.notify_all()
+
+    def _remember_native_batch_unsupported(self) -> None:
+        with self._native_batch_condition:
+            self._native_batch_supported = False
+            self._native_batch_probe_in_progress = False
+            self._native_batch_condition.notify_all()
 
     def _run_batch(self, batch_id: str) -> None:
         started_at = time.time()
@@ -664,7 +1024,10 @@ class TaskManager:
             try:
                 with self.generation_limiter.slot(1):
                     generation = self.generator_factory(settings).generate(
-                        task["prompt"], quality, work_dir
+                        task["prompt"],
+                        quality,
+                        work_dir,
+                        idempotency_key=task["generation_idempotency_key"],
                     )
                 self._persist_generation(task, generation, started_at, "single")
             except Exception as exc:
@@ -675,14 +1038,49 @@ class TaskManager:
 
         native_dir = self.source_dir / f".batch-{batch_id}-{uuid.uuid4().hex}.tmp"
         try:
+            route = self._native_batch_route()
+            if route == "fallback":
+                self._run_fallback(tasks, settings, quality, started_at)
+                return
             try:
                 with self.generation_limiter.slot(len(tasks)):
                     generations = self.generator_factory(settings).generate_many(
-                        tasks[0]["prompt"], quality, native_dir, n=len(tasks)
+                        tasks[0]["prompt"],
+                        quality,
+                        native_dir,
+                        n=len(tasks),
+                        idempotency_key=tasks[0]["generation_idempotency_key"],
                     )
+            except NativeBatchIncomplete as exc:
+                self._remember_native_batch_unsupported()
+                partial_count = len(exc.partial_results)
+                if partial_count >= len(tasks):
+                    raise RuntimeError(
+                        "incomplete native batch reported an invalid partial result count"
+                    ) from exc
+                for task, generation in zip(
+                    tasks[:partial_count], exc.partial_results, strict=True
+                ):
+                    try:
+                        self._persist_generation(
+                            task, generation, started_at, "native_n_partial"
+                        )
+                    except Exception as persist_exc:
+                        self._fail_task(task["task_id"], persist_exc)
+                self._run_fallback(
+                    tasks[partial_count:], settings, quality, started_at
+                )
+                return
             except NativeBatchUnsupported:
+                self._remember_native_batch_unsupported()
                 self._run_fallback(tasks, settings, quality, started_at)
                 return
+            except Exception:
+                if route == "probe":
+                    self._finish_native_batch_probe(None)
+                raise
+            if route == "probe":
+                self._finish_native_batch_probe(True)
             if len(generations) != len(tasks):
                 raise RuntimeError("native batch returned an unexpected result count")
             for task, generation in zip(tasks, generations, strict=True):
@@ -717,7 +1115,10 @@ class TaskManager:
             try:
                 with self.generation_limiter.slot(1):
                     generation = self.generator_factory(settings).generate(
-                        task["prompt"], quality, work_dir
+                        task["prompt"],
+                        quality,
+                        work_dir,
+                        idempotency_key=task["generation_idempotency_key"],
                     )
                 self._persist_generation(task, generation, started_at, "single_fallback")
             except Exception as exc:
@@ -798,8 +1199,8 @@ async def lifespan(_: FastAPI) -> Iterator[None]:
 
 
 app = FastAPI(
-    title="gpt-image-2 Cloud Generation Service",
-    version="3.2.0",
+    title="Image Generation Service",
+    version="4.0.0",
     lifespan=lifespan,
 )
 app.mount("/images", StaticFiles(directory=PUBLIC_IMAGE_DIR), name="public_images")
@@ -811,8 +1212,32 @@ def _bearer_value(authorization: str | None) -> str:
     return ""
 
 
+def _secret_placeholder(value: str) -> bool:
+    normalized = value.strip().lower()
+    return bool(normalized) and (
+        (normalized.startswith("<") and normalized.endswith(">"))
+        or normalized.startswith(("change-me", "replace-me", "set-with-"))
+    )
+
+
+def _service_token_ready() -> bool:
+    token = os.getenv("IMAGE_SERVICE_TOKEN", "")
+    return bool(token) and not _secret_placeholder(token)
+
+
+def _service_auth_required() -> bool:
+    return os.getenv("IMAGE_REQUIRE_SERVICE_AUTH", "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def require_service_token(authorization: str | None = Header(default=None)) -> None:
     expected = os.getenv("IMAGE_SERVICE_TOKEN", "")
+    if _secret_placeholder(expected) or (_service_auth_required() and not expected):
+        raise HTTPException(status_code=503, detail="service authentication is not configured")
     if expected and not secrets.compare_digest(_bearer_value(authorization), expected):
         raise HTTPException(status_code=401, detail="invalid service token")
 
@@ -820,7 +1245,7 @@ def require_service_token(authorization: str | None = Header(default=None)) -> N
 def _worker_token_ready() -> bool:
     worker_token = os.getenv("IMAGE_UPSCALE_WORKER_TOKEN", "")
     service_token = os.getenv("IMAGE_SERVICE_TOKEN", "")
-    return len(worker_token) >= 32 and (
+    return not _secret_placeholder(worker_token) and len(worker_token) >= 32 and (
         not service_token or not secrets.compare_digest(worker_token, service_token)
     )
 
@@ -831,6 +1256,25 @@ def require_worker_token(authorization: str | None = Header(default=None)) -> No
         raise HTTPException(status_code=503, detail="upscale worker authentication is not configured")
     if not secrets.compare_digest(_bearer_value(authorization), expected):
         raise HTTPException(status_code=401, detail="invalid worker token")
+
+
+def _litellm_backend_token_ready() -> bool:
+    token = os.getenv("IMAGE_LITELLM_BACKEND_TOKEN", "")
+    other_tokens = {
+        os.getenv("IMAGE_SERVICE_TOKEN", ""),
+        os.getenv("IMAGE_UPSCALE_WORKER_TOKEN", ""),
+    }
+    return not _secret_placeholder(token) and len(token) >= 32 and token not in other_tokens
+
+
+def require_litellm_backend_token(
+    authorization: str | None = Header(default=None),
+) -> None:
+    expected = os.getenv("IMAGE_LITELLM_BACKEND_TOKEN", "")
+    if not _litellm_backend_token_ready():
+        raise HTTPException(status_code=503, detail="gateway backend authentication is not configured")
+    if not secrets.compare_digest(_bearer_value(authorization), expected):
+        raise HTTPException(status_code=401, detail="invalid gateway backend token")
 
 
 def _validated_worker_id(value: str | None) -> str:
@@ -864,14 +1308,19 @@ def health() -> dict[str, Any]:
         "version": app.version,
         "role": "cloud",
         "api_key_configured": bool(settings.api_key),
-        "model": settings.model,
         "fixed_quality": os.getenv("IMAGE_FIXED_QUALITY", "low"),
-        "generation_worker_count": manager.worker_count,
-        "generation_concurrency_limit": MAX_GENERATION_CONCURRENCY,
-        "generation_slots_in_use": GLOBAL_GENERATION_LIMITER.current,
+        "generation_worker_count": manager.active_worker_count,
+        "generation_workers_active": manager.active_worker_count,
+        "generation_workers_busy": manager.busy_worker_count,
+        "generation_workers_min": manager.min_worker_count,
+        "generation_workers_max": manager.max_worker_count,
+        "generation_concurrency_hard_limit": MAX_GENERATION_CONCURRENCY,
+        "generation_slots_in_use": manager.generation_limiter.current,
         "task_counts": store.counts(),
-        "service_auth_enabled": bool(os.getenv("IMAGE_SERVICE_TOKEN")),
+        "service_auth_enabled": _service_token_ready(),
+        "service_auth_required": _service_auth_required(),
         "upscale_worker_auth_configured": _worker_token_ready(),
+        "litellm_backend_auth_configured": _litellm_backend_token_ready(),
     }
 
 
@@ -979,6 +1428,98 @@ def get_batch_result(
         "summary": counts,
         "results": [_task_result_payload(task, request) for task in tasks],
     }
+
+
+async def _wait_for_terminal_batch(
+    batch_id: str, timeout_seconds: int
+) -> list[dict[str, Any]]:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        tasks = await asyncio.to_thread(store.get_batch, batch_id)
+        if tasks and all(task["status"] in {"done", "failed"} for task in tasks):
+            return tasks
+        await asyncio.sleep(0.5)
+    raise HTTPException(status_code=504, detail="image generation timed out")
+
+
+@app.post("/v1/images/generations", include_in_schema=False)
+async def openai_image_generation_backend(
+    payload: OpenAIImageGenerationRequest,
+    request: Request,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    _: None = Depends(require_litellm_backend_token),
+) -> dict[str, Any]:
+    private_model = os.getenv(
+        "IMAGE_LITELLM_PRIVATE_MODEL", "image-pipeline-private"
+    ).strip()
+    public_alias = os.getenv("IMAGE_PUBLIC_MODEL_ALIAS", "image-gen").strip()
+    if not private_model or not public_alias:
+        raise HTTPException(status_code=503, detail="gateway model mapping is not configured")
+    if not secrets.compare_digest(payload.model, private_model):
+        raise HTTPException(status_code=403, detail="private model mapping rejected")
+    if idempotency_key is not None and not 8 <= len(idempotency_key) <= 200:
+        raise HTTPException(status_code=422, detail="invalid Idempotency-Key")
+
+    if idempotency_key:
+        try:
+            tasks, _ = await asyncio.to_thread(
+                manager.submit_batch_idempotent,
+                payload.prompt,
+                payload.size,
+                payload.n,
+                min(payload.n, MAX_BATCH_SIZE),
+                payload.user,
+                idempotency_key,
+            )
+        except IdempotencyConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from None
+    else:
+        tasks = await asyncio.to_thread(
+            manager.submit_batch,
+            payload.prompt,
+            payload.size,
+            payload.n,
+            min(payload.n, MAX_BATCH_SIZE),
+        )
+
+    timeout_seconds = _positive_int_env("IMAGE_LITELLM_SYNC_TIMEOUT_SECONDS", 600)
+    completed = await _wait_for_terminal_batch(
+        str(tasks[0]["batch_id"]), timeout_seconds
+    )
+    failed = [task for task in completed if task["status"] != "done"]
+    if failed:
+        raise HTTPException(status_code=502, detail="one or more images failed to generate")
+    return {
+        "created": int(time.time()),
+        "model": public_alias,
+        "data": [
+            {
+                "url": f"{public_base_url(request)}/images/{task['image_filename']}"
+            }
+            for task in completed
+        ],
+    }
+
+
+@app.get("/internal/gateway/stats", include_in_schema=False)
+def gateway_stats(
+    _: None = Depends(require_litellm_backend_token),
+) -> dict[str, Any]:
+    stats = store.operational_stats()
+    active_gpu_workers = store.worker_snapshot()
+    stats.update(
+        generation_workers_active=manager.active_worker_count,
+        generation_workers_busy=manager.busy_worker_count,
+        generation_workers_min=manager.min_worker_count,
+        generation_workers_max=manager.max_worker_count,
+        generation_slots_in_use=manager.generation_limiter.current,
+        generation_slots_limit=manager.generation_limiter.capacity,
+        active_gpu_workers=len(active_gpu_workers),
+        busy_gpu_workers=sum(
+            1 for worker in active_gpu_workers if worker["state"] == "busy"
+        ),
+    )
+    return stats
 
 
 @app.get("/internal/upscale/claim", response_model=None)

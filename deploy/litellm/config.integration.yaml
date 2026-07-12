@@ -1,0 +1,28 @@
+model_list:
+  - model_name: image-pipeline-private
+    litellm_params:
+      model: openai/image-pipeline-private
+      api_base: http://host.docker.internal:8013/v1
+      api_key: os.environ/IMAGE_LITELLM_BACKEND_TOKEN
+      timeout: 910
+    model_info:
+      id: image-pipeline-private
+      mode: image_generation
+      input_cost_per_image: os.environ/IMAGE_COST_USD_PER_IMAGE
+
+router_settings:
+  routing_strategy: simple-shuffle
+  allowed_fails: 0
+  model_group_alias:
+    image-gen: image-pipeline-private
+
+litellm_settings:
+  callbacks:
+    - gateway.hook.image_gateway_hook
+  drop_params: true
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/DATABASE_URL
+  store_model_in_db: false
+  disable_spend_logs: false

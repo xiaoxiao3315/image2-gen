@@ -1,0 +1,3 @@
+# Install as /etc/nginx/snippets/image2-gen-backend-auth.conf, owner root:www-data,
+# mode 0640. The populated file must never be committed.
+proxy_set_header Authorization "Bearer <same-secret-as-IMAGE_LITELLM_BACKEND_TOKEN>";

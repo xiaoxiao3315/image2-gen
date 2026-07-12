@@ -1,0 +1,18 @@
+[Unit]
+Description=Image2Gen LiteLLM gateway and PostgreSQL
+Wants=network-online.target
+Requires=docker.service
+After=network-online.target docker.service image2-gen.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/image2-gen/deploy/litellm
+ExecStart=/usr/bin/docker compose --env-file /etc/image2-gen/litellm.env -f docker-compose.yml up -d --remove-orphans
+ExecReload=/usr/bin/docker compose --env-file /etc/image2-gen/litellm.env -f docker-compose.yml up -d --force-recreate --remove-orphans
+ExecStop=/usr/bin/docker compose --env-file /etc/image2-gen/litellm.env -f docker-compose.yml stop -t 930
+TimeoutStartSec=600s
+TimeoutStopSec=950s
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,50 @@
+services:
+  postgres:
+    image: postgres:16.14-alpine3.24@sha256:7a396fd264a2067788b6551122b50f162bf6136312c7fc9d74381cb92c648382
+    platform: linux/amd64
+    environment:
+      POSTGRES_DB: litellm
+      POSTGRES_USER: litellm
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    ports:
+      - 127.0.0.1:55432:5432
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U litellm -d litellm]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    mem_limit: 256m
+
+  litellm:
+    image: ghcr.io/berriai/litellm-database:v1.91.2@sha256:64696cd89e425c2b2d0e0c78cece7d52430185ef155a5b0a67557ab9a226af9b
+    platform: linux/amd64
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://litellm:${POSTGRES_PASSWORD}@postgres:5432/litellm
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?set LITELLM_MASTER_KEY}
+      LITELLM_SALT_KEY: ${LITELLM_SALT_KEY:?set LITELLM_SALT_KEY}
+      IMAGE_LITELLM_BACKEND_TOKEN: ${IMAGE_LITELLM_BACKEND_TOKEN:?set IMAGE_LITELLM_BACKEND_TOKEN}
+      IMAGE_COST_USD_PER_IMAGE: ${IMAGE_COST_USD_PER_IMAGE:?set IMAGE_COST_USD_PER_IMAGE}
+      PYTHONPATH: /opt/image2-gen
+    volumes:
+      - ../..:/opt/image2-gen:ro
+      - ./config.integration.yaml:/app/config.yaml:ro
+      - ../../gateway:/app/gateway:ro
+    ports:
+      - 127.0.0.1:4000:4000
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    command:
+      - --config
+      - /app/config.yaml
+      - --host
+      - 0.0.0.0
+      - --port
+      - "4000"
+      - --num_workers
+      - "1"
+    # The database image performs Prisma setup on first start; integration keeps
+    # headroom so we can measure the real peak before setting production limits.
+    mem_limit: 1200m

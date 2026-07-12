@@ -345,7 +345,9 @@ def test_generation_worker_stops_at_awaiting_upscale(monkeypatch, tmp_path: Path
     store = service.TaskStore(tmp_path / "tasks.db")
 
     class FakeGenerator:
-        def generate(self, prompt: str, quality: str, output_dir: Path) -> GenerationResult:
+        def generate(
+            self, prompt: str, quality: str, output_dir: Path, **_kwargs: object
+        ) -> GenerationResult:
             output_dir.mkdir(parents=True)
             path = output_dir / "source.png"
             path.write_bytes(_png_bytes((1536, 1024)))
