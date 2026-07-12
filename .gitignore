@@ -24,12 +24,16 @@ resp.tmp
 # 结果/输出目录
 acceptance-results/
 banana-async-results/
+capacity-benchmarks/
 codex-image2-results/
 codex-stream-results/
+external-validation/
 gemini-nano-results/
 misc-capability-results/
 output/
 runs/
+service-data/
+remote-worker-data/
 # 大二进制（Real-ESRGAN 另行下载，见 README）
 tools/realesrgan-ncnn-vulkan/
 # 索引/缓存

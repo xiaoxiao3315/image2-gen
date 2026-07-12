@@ -1,0 +1,17 @@
+[Unit]
+Description=Delete expired Image2Gen tasks and image files
+ConditionPathExists=/var/lib/image2-gen/tasks.db
+After=image2-gen.service
+
+[Service]
+Type=oneshot
+User=image2gen
+Group=image2gen
+WorkingDirectory=/opt/image2-gen
+ExecStart=/opt/image2-gen/.venv/bin/python /opt/image2-gen/scripts/cleanup_service_data.py --data-root /var/lib/image2-gen --older-than-days 7
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/image2-gen

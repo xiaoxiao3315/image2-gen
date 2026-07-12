@@ -46,6 +46,10 @@ def _parser() -> argparse.ArgumentParser:
     serve = commands.add_parser("serve", help="Run the local FastAPI service")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", default=8012, type=int)
+    commands.add_parser(
+        "upscale-worker",
+        help="Poll the cloud service and process claimed jobs with local Real-ESRGAN",
+    )
     return parser
 
 
@@ -125,7 +129,18 @@ def main() -> int:
     if args.command == "serve":
         import uvicorn
 
-        uvicorn.run("image_pipeline.service:app", host=args.host, port=args.port)
+        uvicorn.run(
+            "image_pipeline.service:app",
+            host=args.host,
+            port=args.port,
+            proxy_headers=True,
+            forwarded_allow_ips="*",
+        )
+        return 0
+    if args.command == "upscale-worker":
+        from image_pipeline.remote_worker import run_remote_worker
+
+        run_remote_worker()
         return 0
     return 2
 

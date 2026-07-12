@@ -28,6 +28,7 @@ class GenerationResult:
     download_seconds: float
     total_seconds: float
     response_image_trail: str
+    usage: dict[str, Any] | None
     image: ImageMetadata
 
 

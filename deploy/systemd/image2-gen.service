@@ -1,0 +1,31 @@
+[Unit]
+Description=Image2Gen cloud API and generation queue
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=image2gen
+Group=image2gen
+WorkingDirectory=/opt/image2-gen
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/etc/image2-gen/image2-gen.env
+ExecStart=/opt/image2-gen/.venv/bin/python /opt/image2-gen/cli.py serve --host 127.0.0.1 --port 8012
+Restart=always
+RestartSec=5s
+TimeoutStopSec=30s
+KillSignal=SIGINT
+UMask=0027
+MemoryHigh=450M
+MemoryMax=500M
+
+# The cloud process only needs its data directory and outbound network access.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/image2-gen
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target
