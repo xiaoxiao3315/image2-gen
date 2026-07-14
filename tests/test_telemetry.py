@@ -184,6 +184,69 @@ def test_read_timeout_then_success_and_three_failures(
     assert len([1 for event, _ in failed_events if event == "finished"]) == 3
 
 
+def test_normalize_error_uses_only_explicit_cause() -> None:
+    explicit_cause = requests.ReadTimeout("explicit timeout")
+    try:
+        raise ImageGenerationError("request failed") from explicit_cause
+    except ImageGenerationError as wrapped:
+        assert wrapped.__cause__ is explicit_cause
+        assert normalize_error(wrapped) == "read_timeout"
+
+
+def test_normalize_error_ignores_implicit_context() -> None:
+    try:
+        raise requests.ReadTimeout("unrelated earlier timeout")
+    except requests.ReadTimeout as unrelated:
+        try:
+            raise ImageGenerationError("current failure")
+        except ImageGenerationError as current:
+            assert current.__cause__ is None
+            assert current.__context__ is unrelated
+            assert normalize_error(current) == "unknown"
+
+
+def test_normalize_error_limits_explicit_cause_to_two_hops() -> None:
+    outer = ImageGenerationError("outer")
+    middle = ImageGenerationError("middle")
+    timeout = requests.ReadTimeout("explicit timeout")
+    outer.__cause__ = middle
+    middle.__cause__ = timeout
+    assert normalize_error(outer) == "read_timeout"
+
+    inner = ImageGenerationError("inner")
+    middle.__cause__ = inner
+    inner.__cause__ = timeout
+    assert normalize_error(outer) == "unknown"
+
+    middle.__cause__ = outer
+    assert normalize_error(outer) == "unknown"
+
+
+def test_task_manager_terminal_failure_keeps_wrapped_timeout_category(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("IMAGE_API_KEY", "unit-test-key")
+    monkeypatch.setenv("IMAGE_API_BASE_URL", "https://provider.invalid/v1")
+    store = TaskStore(tmp_path / "manager.db")
+    manager = __import__(
+        "image_pipeline.service", fromlist=["TaskManager"]
+    ).TaskManager(store, source_dir=tmp_path / "sources")
+    task = store.create("p", "2k")
+    store.update(task["task_id"], status="processing")
+    try:
+        raise ImageGenerationError("request failed") from requests.ReadTimeout(
+            "sensitive timeout"
+        )
+    except ImageGenerationError as wrapped:
+        manager._fail_task(task["task_id"], wrapped)
+
+    timeline = store.telemetry.task_timeline(task["task_id"])
+    terminal = [
+        event for event in timeline["events"] if event["event_type"] == "terminal_failed"
+    ]
+    assert terminal[-1]["details"]["category"] == "read_timeout"
+
+
 def test_malformed_response_and_download_failure_are_classifiable(tmp_path: Path) -> None:
     malformed_events: list[tuple[str, dict[str, Any]]] = []
     with pytest.raises(ImageGenerationError, match="non-JSON"):

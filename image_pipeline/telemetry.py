@@ -63,15 +63,36 @@ def normalize_error(
     if error is None:
         return "unknown"
 
-    name = type(error).__name__.lower()
-    if "connecttimeout" in name:
-        return "connect_timeout"
-    if "readtimeout" in name or name == "timeout":
-        return "read_timeout"
-    if any(part in name for part in ("chunked", "remotedisconnected", "protocolerror")):
-        return "remote_disconnect"
-    if "connection" in name:
-        return "connection_error"
+    def classify_exception(candidate: BaseException) -> str:
+        name = type(candidate).__name__.lower()
+        if "connecttimeout" in name:
+            return "connect_timeout"
+        if "readtimeout" in name or name == "timeout":
+            return "read_timeout"
+        if any(
+            part in name
+            for part in ("chunked", "remotedisconnected", "protocolerror")
+        ):
+            return "remote_disconnect"
+        if "connection" in name:
+            return "connection_error"
+        return "unknown"
+
+    category = classify_exception(error)
+    if category != "unknown":
+        return category
+
+    current = error
+    seen = {id(error)}
+    for _ in range(2):
+        cause = current.__cause__
+        if cause is None or id(cause) in seen:
+            break
+        seen.add(id(cause))
+        category = classify_exception(cause)
+        if category != "unknown":
+            return category
+        current = cause
     return "unknown"
 
 
