@@ -7,7 +7,7 @@ import re
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import requests
 
@@ -41,6 +41,24 @@ class NativeBatchIncomplete(ImageGenerationError):
 DEFAULT_API_MAX_ATTEMPTS = 3
 MAX_API_MAX_ATTEMPTS = 3
 API_RETRY_BASE_SECONDS = 1.0
+
+AttemptObserver = Callable[[str, dict[str, Any]], None]
+
+
+def _notify_attempt(
+    observer: AttemptObserver | None, event: str, **payload: Any
+) -> None:
+    if observer is None:
+        return
+    try:
+        observer(event, payload)
+    except Exception:
+        # Telemetry is deliberately best-effort and may never affect generation.
+        return
+
+
+def _request_id(response: requests.Response) -> str | None:
+    return response.headers.get("x-request-id") or response.headers.get("request-id")
 
 
 def _api_max_attempts() -> int:
@@ -153,6 +171,8 @@ class GptImageGenerator:
         quality: str,
         output_dir: Path,
         idempotency_key: str | None = None,
+        *,
+        attempt_observer: AttemptObserver | None = None,
     ) -> GenerationResult:
         return self.generate_many(
             prompt,
@@ -160,6 +180,7 @@ class GptImageGenerator:
             output_dir,
             n=1,
             idempotency_key=idempotency_key,
+            attempt_observer=attempt_observer,
         )[0]
 
     def generate_many(
@@ -169,6 +190,8 @@ class GptImageGenerator:
         output_dir: Path,
         n: int,
         idempotency_key: str | None = None,
+        *,
+        attempt_observer: AttemptObserver | None = None,
     ) -> list[GenerationResult]:
         if quality not in TIERS:
             raise ValueError(f"quality must be one of {', '.join(TIERS)}")
@@ -201,7 +224,21 @@ class GptImageGenerator:
 
         api_started = time.perf_counter()
         max_attempts = _api_max_attempts()
+        response: requests.Response | None = None
+        physical_started = 0.0
+        physical_wall_started = 0.0
+        physical_attempt = 0
         for attempt in range(1, max_attempts + 1):
+            physical_attempt = attempt
+            physical_started = time.perf_counter()
+            physical_wall_started = time.time()
+            _notify_attempt(
+                attempt_observer,
+                "started",
+                attempt_no=attempt,
+                started_at=physical_wall_started,
+                requested_n=n,
+            )
             try:
                 response = self.session.post(
                     endpoint,
@@ -213,27 +250,103 @@ class GptImageGenerator:
                     ),
                 )
             except (requests.ConnectionError, requests.Timeout) as exc:
-                if attempt >= max_attempts:
+                retry = attempt < max_attempts
+                backoff = _retry_delay_seconds(attempt) if retry else None
+                _notify_attempt(
+                    attempt_observer,
+                    "finished",
+                    attempt_no=attempt,
+                    finished_at=time.time(),
+                    duration_seconds=time.perf_counter() - physical_started,
+                    http_status=None,
+                    outcome="retryable_error" if retry else "failed",
+                    error=exc,
+                    phase="request",
+                    will_retry=retry,
+                    backoff_seconds=backoff,
+                    provider_request_id=None,
+                )
+                if not retry:
                     raise ImageGenerationError(
                         f"Image API request failed after {attempt} attempts: "
                         f"{type(exc).__name__}"
                     ) from exc
-                time.sleep(_retry_delay_seconds(attempt))
+                _notify_attempt(
+                    attempt_observer,
+                    "retry_backoff",
+                    attempt_no=attempt,
+                    occurred_at=time.time(),
+                    backoff_seconds=backoff,
+                )
+                time.sleep(backoff)
                 continue
             except requests.RequestException as exc:
+                _notify_attempt(
+                    attempt_observer,
+                    "finished",
+                    attempt_no=attempt,
+                    finished_at=time.time(),
+                    duration_seconds=time.perf_counter() - physical_started,
+                    http_status=None,
+                    outcome="failed",
+                    error=exc,
+                    phase="request",
+                    will_retry=False,
+                    backoff_seconds=None,
+                    provider_request_id=None,
+                )
                 # Other request failures are not known-transient and must not be replayed.
                 raise ImageGenerationError(
                     f"Image API request failed: {type(exc).__name__}"
                 ) from exc
 
-            if response.status_code != 503 or attempt >= max_attempts:
-                break
-            # Do not inspect or log the gateway response body. A 503 is the only
-            # HTTP status replayed; the same Idempotency-Key is retained above.
-            time.sleep(_retry_delay_seconds(attempt))
+            if response.status_code == 503 and attempt < max_attempts:
+                backoff = _retry_delay_seconds(attempt)
+                _notify_attempt(
+                    attempt_observer,
+                    "finished",
+                    attempt_no=attempt,
+                    finished_at=time.time(),
+                    duration_seconds=time.perf_counter() - physical_started,
+                    http_status=response.status_code,
+                    outcome="retryable_error",
+                    error=None,
+                    phase="request",
+                    will_retry=True,
+                    backoff_seconds=backoff,
+                    provider_request_id=_request_id(response),
+                )
+                # Do not inspect or log the gateway response body. A 503 is the only
+                # HTTP status replayed; the same Idempotency-Key is retained above.
+                _notify_attempt(
+                    attempt_observer,
+                    "retry_backoff",
+                    attempt_no=attempt,
+                    occurred_at=time.time(),
+                    backoff_seconds=backoff,
+                )
+                time.sleep(backoff)
+                continue
+            break
         api_seconds = time.perf_counter() - api_started
+        if response is None:
+            raise ImageGenerationError("Image API request ended without a response")
 
         if response.status_code != 200:
+            _notify_attempt(
+                attempt_observer,
+                "finished",
+                attempt_no=physical_attempt,
+                finished_at=time.time(),
+                duration_seconds=time.perf_counter() - physical_started,
+                http_status=response.status_code,
+                outcome="failed",
+                error=None,
+                phase="request",
+                will_retry=False,
+                backoff_seconds=None,
+                provider_request_id=_request_id(response),
+            )
             if n > 1 and _native_batch_is_explicitly_unsupported(response):
                 raise NativeBatchUnsupported(
                     "Image API explicitly does not support native n > 1"
@@ -245,12 +358,23 @@ class GptImageGenerator:
         try:
             payload = response.json()
         except ValueError as exc:
+            _notify_attempt(
+                attempt_observer,
+                "finished",
+                attempt_no=physical_attempt,
+                finished_at=time.time(),
+                duration_seconds=time.perf_counter() - physical_started,
+                http_status=response.status_code,
+                outcome="failed",
+                error=exc,
+                phase="json",
+                will_retry=False,
+                backoff_seconds=None,
+                provider_request_id=_request_id(response),
+            )
             raise ImageGenerationError("Image API returned non-JSON HTTP 200") from exc
 
-        request_id = (
-            response.headers.get("x-request-id")
-            or response.headers.get("request-id")
-        )
+        request_id = _request_id(response)
         usage = _safe_usage(payload)
         # requests keeps the complete response bytes in addition to the decoded JSON.
         # Drop that duplicate before decoding potentially large base64 candidates.
@@ -258,56 +382,93 @@ class GptImageGenerator:
             response._content = b""
 
         results: list[GenerationResult] = []
-        for index in range(n):
-            candidate = _pop_image(payload)
-            if candidate is None:
-                raise NativeBatchIncomplete(
-                    f"Image API HTTP 200 response contained only {len(results)} of {n} images",
-                    partial_results=results,
-                    requested_count=n,
-                )
-            kind, value, trail = candidate
-            download_started = time.perf_counter()
-            if kind == "base64":
-                try:
-                    raw = base64.b64decode(value, validate=False)
-                except Exception as exc:
-                    raise ImageGenerationError("Image base64 could not be decoded") from exc
-            else:
-                try:
-                    image_response = self.session.get(
-                        value,
-                        timeout=self.settings.api_timeout_seconds,
+        failure_phase = "candidate"
+        try:
+            for index in range(n):
+                candidate = _pop_image(payload)
+                if candidate is None:
+                    raise NativeBatchIncomplete(
+                        f"Image API HTTP 200 response contained only {len(results)} of {n} images",
+                        partial_results=results,
+                        requested_count=n,
                     )
-                    image_response.raise_for_status()
-                    raw = image_response.content
-                except requests.RequestException as exc:
-                    raise ImageGenerationError("Returned image URL could not be downloaded") from exc
-            download_seconds = time.perf_counter() - download_started
+                kind, value, trail = candidate
+                download_started = time.perf_counter()
+                if kind == "base64":
+                    failure_phase = "image_decode"
+                    try:
+                        raw = base64.b64decode(value, validate=False)
+                    except Exception as exc:
+                        raise ImageGenerationError("Image base64 could not be decoded") from exc
+                else:
+                    failure_phase = "image_download"
+                    try:
+                        image_response = self.session.get(
+                            value,
+                            timeout=self.settings.api_timeout_seconds,
+                        )
+                        image_response.raise_for_status()
+                        raw = image_response.content
+                    except requests.RequestException as exc:
+                        raise ImageGenerationError("Returned image URL could not be downloaded") from exc
+                download_seconds = time.perf_counter() - download_started
 
-            try:
-                extension = extension_for_image(raw)
-            except Exception as exc:
-                raise ImageGenerationError("Returned bytes are not a Pillow-decodable image") from exc
-            stem = "source" if n == 1 else f"source-{index + 1}"
-            image_path = output_dir / f"{stem}{extension}"
-            image_path.write_bytes(raw)
-            del raw
-            image = inspect_image(image_path)
-            results.append(
-                GenerationResult(
-                    requested_model=self.settings.model,
-                    requested_quality=quality,
-                    requested_size=self.settings.source_size,
-                    request_body=request_body,
-                    status_code=response.status_code,
-                    request_id=request_id,
-                    api_seconds=round(api_seconds, 3),
-                    download_seconds=round(download_seconds, 3),
-                    total_seconds=round(api_seconds + download_seconds, 3),
-                    response_image_trail=trail,
-                    usage=usage,
-                    image=image,
+                failure_phase = "image_decode"
+                try:
+                    extension = extension_for_image(raw)
+                except Exception as exc:
+                    raise ImageGenerationError("Returned bytes are not a Pillow-decodable image") from exc
+                failure_phase = "filesystem"
+                stem = "source" if n == 1 else f"source-{index + 1}"
+                image_path = output_dir / f"{stem}{extension}"
+                image_path.write_bytes(raw)
+                del raw
+                image = inspect_image(image_path)
+                results.append(
+                    GenerationResult(
+                        requested_model=self.settings.model,
+                        requested_quality=quality,
+                        requested_size=self.settings.source_size,
+                        request_body=request_body,
+                        status_code=response.status_code,
+                        request_id=request_id,
+                        api_seconds=round(api_seconds, 3),
+                        download_seconds=round(download_seconds, 3),
+                        total_seconds=round(api_seconds + download_seconds, 3),
+                        response_image_trail=trail,
+                        usage=usage,
+                        image=image,
+                    )
                 )
+                failure_phase = "candidate"
+        except Exception as exc:
+            _notify_attempt(
+                attempt_observer,
+                "finished",
+                attempt_no=physical_attempt,
+                finished_at=time.time(),
+                duration_seconds=time.perf_counter() - physical_started,
+                http_status=response.status_code,
+                outcome="partial_success" if results else "failed",
+                error=exc,
+                phase=failure_phase,
+                will_retry=False,
+                backoff_seconds=None,
+                provider_request_id=request_id,
             )
+            raise
+        _notify_attempt(
+            attempt_observer,
+            "finished",
+            attempt_no=physical_attempt,
+            finished_at=time.time(),
+            duration_seconds=time.perf_counter() - physical_started,
+            http_status=response.status_code,
+            outcome="success",
+            error=None,
+            phase=None,
+            will_retry=False,
+            backoff_seconds=None,
+            provider_request_id=request_id,
+        )
         return results

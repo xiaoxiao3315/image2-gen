@@ -57,22 +57,63 @@ def cleanup(data_root: Path, older_than_days: float, *, now: float | None = None
                 "AND COALESCE(completed_at,created_at) < ?",
                 (cutoff,),
             ).fetchall()
-        for row in rows:
-            for path in (
-                _safe_child(images, row["image_filename"]),
-                _safe_child(sources, row["source_filename"]),
-            ):
-                if path is not None and (path.is_file() or path.is_symlink()):
-                    path.unlink(missing_ok=True)
-            connection.execute("DELETE FROM tasks WHERE task_id=?", (row["task_id"],))
-            removed += 1
         tables = {
             str(row[0])
             for row in connection.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'"
             ).fetchall()
         }
-        if "api_idempotency" in tables:
+        event_columns = (
+            {
+                str(item[1])
+                for item in connection.execute("PRAGMA table_info(task_events)").fetchall()
+            }
+            if "task_events" in tables
+            else set()
+        )
+        attempt_columns = (
+            {
+                str(item[1])
+                for item in connection.execute(
+                    "PRAGMA table_info(generation_attempts)"
+                ).fetchall()
+            }
+            if "generation_attempts" in tables
+            else set()
+        )
+        # Clear each persisted file reference immediately after a successful unlink.
+        # If a later artifact fails to unlink, the retained task stays discoverable
+        # without pointing at an already-deleted file.
+        for row in rows:
+            task_id = str(row["task_id"])
+            artifact_columns = (
+                ("source_filename", _safe_child(sources, row["source_filename"])),
+                ("image_filename", _safe_child(images, row["image_filename"])),
+            )
+            for column, path in artifact_columns:
+                if path is not None and (path.is_file() or path.is_symlink()):
+                    path.unlink(missing_ok=True)
+                    if column in columns:
+                        connection.execute(
+                            f"UPDATE tasks SET {column}=NULL WHERE task_id=?",
+                            (task_id,),
+                        )
+                        connection.commit()
+            if "task_id" in event_columns:
+                connection.execute("DELETE FROM task_events WHERE task_id=?", (task_id,))
+            if "task_id" in attempt_columns:
+                connection.execute(
+                    "DELETE FROM generation_attempts WHERE task_id=?", (task_id,)
+                )
+            connection.execute("DELETE FROM tasks WHERE task_id=?", (task_id,))
+            connection.commit()
+            removed += 1
+        if "batch_id" in attempt_columns and "batch_id" in columns:
+            connection.execute(
+                "DELETE FROM generation_attempts WHERE batch_id IS NOT NULL AND NOT EXISTS ("
+                "SELECT 1 FROM tasks WHERE tasks.batch_id=generation_attempts.batch_id)"
+            )
+        if "api_idempotency" in tables and "batch_id" in columns:
             connection.execute(
                 "DELETE FROM api_idempotency "
                 "WHERE NOT EXISTS ("

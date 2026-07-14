@@ -42,6 +42,11 @@ from .generator import (
     NativeBatchUnsupported,
 )
 from .image_io import inspect_image
+from .telemetry import (
+    TelemetryStore,
+    normalize_error,
+    safe_error_summary,
+)
 
 
 SERVICE_ROOT = Path(os.getenv("IMAGE_SERVICE_DATA", PROJECT_ROOT / "service-data")).resolve()
@@ -226,7 +231,20 @@ class TaskStore:
     def __init__(self, path: Path):
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.telemetry = TelemetryStore(self.path)
+        self.recovered_generation_tasks: list[str] = []
         self._initialize()
+        self.telemetry.try_reconcile_open_attempts(
+            restart_task_ids=self.recovered_generation_tasks
+        )
+        recovered_at = time.time()
+        for task_id in self.recovered_generation_tasks:
+            self.telemetry.try_event(
+                task_id,
+                "generation_queued",
+                occurred_at=recovered_at,
+                details={"reason": "restart_recovery"},
+            )
 
     def connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=30)
@@ -284,11 +302,18 @@ class TaskStore:
                 "WHERE generation_idempotency_key IS NULL OR generation_idempotency_key=''"
             )
             # Generation calls interrupted by a process restart are safe to enqueue again;
-            # an active GPU claim is only recovered after its lease expires.
+            # an active GPU claim is only recovered after its lease expires. Telemetry
+            # reconciliation happens after this business transaction commits, so a
+            # malformed/busy telemetry table cannot block authoritative task recovery.
+            recovered_rows = connection.execute(
+                "SELECT task_id FROM tasks WHERE status IN ('running', 'processing')"
+            ).fetchall()
+            recovered_ids = [str(row[0]) for row in recovered_rows]
             connection.execute(
                 "UPDATE tasks SET status='queued', started_at=NULL "
                 "WHERE status IN ('running', 'processing')"
             )
+            self.recovered_generation_tasks = recovered_ids
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_tasks_status_created "
                 "ON tasks(status, created_at)"
@@ -374,6 +399,13 @@ class TaskStore:
                     )
                     for record in records
                 ],
+            )
+        for record in records:
+            self.telemetry.try_event(
+                record["task_id"], "accepted", occurred_at=created_at
+            )
+            self.telemetry.try_event(
+                record["task_id"], "generation_queued", occurred_at=created_at
             )
         return records
 
@@ -482,6 +514,13 @@ class TaskStore:
                 (tenant_hash, key_hash, request_hash, batch_id, created_at),
             )
             connection.commit()
+            for record in records:
+                self.telemetry.try_event(
+                    record["task_id"], "accepted", occurred_at=created_at
+                )
+                self.telemetry.try_event(
+                    record["task_id"], "generation_queued", occurred_at=created_at
+                )
             return records, False
         finally:
             connection.close()
@@ -628,6 +667,12 @@ class TaskStore:
         connection = self.connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
+            expired_rows = connection.execute(
+                "SELECT task_id,claimed_at,claimed_by,upscale_attempts FROM tasks "
+                "WHERE status='upscaling' AND lease_expires_at IS NOT NULL "
+                "AND lease_expires_at<=?",
+                (now,),
+            ).fetchall()
             connection.execute(
                 "UPDATE tasks SET status='awaiting_upscale',claim_token=NULL,"
                 "claimed_at=NULL,lease_expires_at=NULL,claimed_by=NULL,"
@@ -643,6 +688,27 @@ class TaskStore:
             if row is None:
                 self._touch_worker(connection, worker_id, "idle", None, now)
                 connection.commit()
+                for expired in expired_rows:
+                    expired_duration = (
+                        None
+                        if expired["claimed_at"] is None
+                        else max(0.0, now - float(expired["claimed_at"]))
+                    )
+                    self.telemetry.try_event(
+                        str(expired["task_id"]),
+                        "upscale_finished",
+                        occurred_at=now,
+                        duration_seconds=expired_duration,
+                        attempt_no=int(expired["upscale_attempts"] or 0),
+                        worker_id=expired["claimed_by"],
+                        details={"outcome": "lease_expired"},
+                    )
+                    self.telemetry.try_event(
+                        str(expired["task_id"]),
+                        "upscale_queued",
+                        occurred_at=now,
+                        details={"reason": "lease_expired"},
+                    )
                 return None
             lease_expires_at = now + lease_seconds
             cursor = connection.execute(
@@ -664,6 +730,27 @@ class TaskStore:
                 return None
             self._touch_worker(connection, worker_id, "busy", str(row["task_id"]), now)
             connection.commit()
+            for expired in expired_rows:
+                expired_duration = (
+                    None
+                    if expired["claimed_at"] is None
+                    else max(0.0, now - float(expired["claimed_at"]))
+                )
+                self.telemetry.try_event(
+                    str(expired["task_id"]),
+                    "upscale_finished",
+                    occurred_at=now,
+                    duration_seconds=expired_duration,
+                    attempt_no=int(expired["upscale_attempts"] or 0),
+                    worker_id=expired["claimed_by"],
+                    details={"outcome": "lease_expired"},
+                )
+                self.telemetry.try_event(
+                    str(expired["task_id"]),
+                    "upscale_queued",
+                    occurred_at=now,
+                    details={"reason": "lease_expired"},
+                )
             result = dict(row)
             result.update(
                 status="upscaling",
@@ -673,6 +760,17 @@ class TaskStore:
                 claimed_by=worker_id,
                 lease_heartbeat_at=now,
                 upscale_attempts=int(row["upscale_attempts"] or 0) + 1,
+            )
+            upscale_queue_seconds = self.telemetry.seconds_since_latest_event(
+                str(row["task_id"]), "upscale_queued", occurred_at=now
+            )
+            self.telemetry.try_event(
+                str(row["task_id"]),
+                "upscale_started",
+                occurred_at=now,
+                duration_seconds=upscale_queue_seconds,
+                attempt_no=result["upscale_attempts"],
+                worker_id=worker_id,
             )
             return result
         finally:
@@ -747,6 +845,32 @@ class TaskStore:
                 (worker_id,),
             )
             connection.commit()
+            upscale_duration = self.telemetry.seconds_since_latest_event(
+                task_id, "upscale_started", occurred_at=now
+            )
+            self.telemetry.try_event(
+                task_id,
+                "upscale_finished",
+                occurred_at=now,
+                duration_seconds=upscale_duration,
+                attempt_no=attempts,
+                worker_id=worker_id,
+                details={"outcome": "failed" if terminal else "retry"},
+            )
+            if terminal:
+                self.telemetry.try_event(
+                    task_id,
+                    "terminal_failed",
+                    occurred_at=now,
+                    details={"stage": "upscale", "category": "worker_failure"},
+                )
+            else:
+                self.telemetry.try_event(
+                    task_id,
+                    "upscale_queued",
+                    occurred_at=now,
+                    details={"reason": "worker_release"},
+                )
             return next_status
         finally:
             connection.close()
@@ -823,6 +947,101 @@ class TaskManager:
         self.generation_limiter = generation_limiter or WeightedLimiter(
             MAX_GENERATION_CONCURRENCY
         )
+
+    def _attempt_observer(
+        self,
+        tasks: list[dict[str, Any]],
+        settings: Settings,
+        request_kind: str,
+    ) -> Callable[[str, dict[str, Any]], None]:
+        task_ids = [str(task["task_id"]) for task in tasks]
+        batch_id = str(tasks[0]["batch_id"]) if tasks else None
+        base_attempt = self.store.telemetry.next_attempt_no(task_ids)
+        open_attempts: dict[int, str | None] = {}
+
+        def observe(event: str, payload: dict[str, Any]) -> None:
+            provider_ordinal = int(payload.get("attempt_no") or 1)
+            attempt_no = base_attempt + provider_ordinal - 1
+            if event == "started":
+                open_attempts[provider_ordinal] = self.store.telemetry.try_start_attempt(
+                    task_ids=task_ids,
+                    batch_id=batch_id,
+                    attempt_no=attempt_no,
+                    request_kind=request_kind,
+                    requested_n=int(payload.get("requested_n") or len(task_ids) or 1),
+                    started_at=float(payload.get("started_at") or time.time()),
+                    route_label=settings.model,
+                )
+                return
+            if event == "retry_backoff":
+                backoff = float(payload.get("backoff_seconds") or 0.0)
+                for task_id in task_ids:
+                    self.store.telemetry.try_event(
+                        task_id,
+                        "generation_retry_backoff",
+                        occurred_at=float(payload.get("occurred_at") or time.time()),
+                        duration_seconds=backoff,
+                        attempt_no=attempt_no,
+                    )
+                return
+            if event != "finished":
+                return
+            error = payload.get("error")
+            http_status = payload.get("http_status")
+            category = None
+            if error is not None or (http_status is not None and int(http_status) != 200):
+                category = normalize_error(
+                    error if isinstance(error, BaseException) else None,
+                    http_status=None if http_status is None else int(http_status),
+                    phase=str(payload.get("phase") or "") or None,
+                )
+            self.store.telemetry.try_finish_attempt(
+                open_attempts.get(provider_ordinal),
+                finished_at=float(payload.get("finished_at") or time.time()),
+                duration_seconds=float(payload.get("duration_seconds") or 0.0),
+                http_status=None if http_status is None else int(http_status),
+                outcome=str(payload.get("outcome") or "unknown"),
+                error_category=category,
+                will_retry=bool(payload.get("will_retry")),
+                backoff_seconds=(
+                    None
+                    if payload.get("backoff_seconds") is None
+                    else float(payload["backoff_seconds"])
+                ),
+                error_summary=(
+                    None
+                    if category is None
+                    else safe_error_summary(
+                        error if isinstance(error, BaseException) else None,
+                        category=category,
+                        http_status=None if http_status is None else int(http_status),
+                    )
+                ),
+                provider_request_id=(
+                    None
+                    if payload.get("provider_request_id") is None
+                    else str(payload["provider_request_id"])
+                ),
+            )
+
+        return observe
+
+    @staticmethod
+    def _set_observer_if_supported(
+        generator: Any,
+        observer: Callable[[str, dict[str, Any]], None],
+        method_name: str,
+    ) -> dict[str, Any]:
+        # Pass the optional observer only when the called method advertises it.
+        # This preserves subclasses and test fakes that retain the former signature.
+        import inspect
+
+        method = getattr(generator, method_name, None)
+        try:
+            parameters = inspect.signature(method).parameters
+        except (TypeError, ValueError):
+            return {}
+        return {"attempt_observer": observer} if "attempt_observer" in parameters else {}
 
     @property
     def worker_count(self) -> int:
@@ -1011,6 +1230,13 @@ class TaskManager:
         tasks = self.store.begin_batch_generation(batch_id, started_at)
         if not tasks:
             return
+        for task in tasks:
+            self.store.telemetry.try_event(
+                str(task["task_id"]),
+                "generation_started",
+                occurred_at=started_at,
+                duration_seconds=max(0.0, started_at - float(task["created_at"])),
+            )
         quality = os.getenv("IMAGE_FIXED_QUALITY", "low").strip().lower()
         try:
             settings = Settings.from_env(require_key=True)
@@ -1022,12 +1248,17 @@ class TaskManager:
             task = tasks[0]
             work_dir = self.source_dir / f".{task['task_id']}-{uuid.uuid4().hex}.tmp"
             try:
+                generator = self.generator_factory(settings)
+                observer = self._attempt_observer([task], settings, "single")
                 with self.generation_limiter.slot(1):
-                    generation = self.generator_factory(settings).generate(
+                    generation = generator.generate(
                         task["prompt"],
                         quality,
                         work_dir,
                         idempotency_key=task["generation_idempotency_key"],
+                        **self._set_observer_if_supported(
+                            generator, observer, "generate"
+                        ),
                     )
                 self._persist_generation(task, generation, started_at, "single")
             except Exception as exc:
@@ -1043,13 +1274,18 @@ class TaskManager:
                 self._run_fallback(tasks, settings, quality, started_at)
                 return
             try:
+                generator = self.generator_factory(settings)
+                observer = self._attempt_observer(tasks, settings, "native_n")
                 with self.generation_limiter.slot(len(tasks)):
-                    generations = self.generator_factory(settings).generate_many(
+                    generations = generator.generate_many(
                         tasks[0]["prompt"],
                         quality,
                         native_dir,
                         n=len(tasks),
                         idempotency_key=tasks[0]["generation_idempotency_key"],
+                        **self._set_observer_if_supported(
+                            generator, observer, "generate_many"
+                        ),
                     )
             except NativeBatchIncomplete as exc:
                 self._remember_native_batch_unsupported()
@@ -1113,12 +1349,17 @@ class TaskManager:
         def generate_one(task: dict[str, Any]) -> None:
             work_dir = self.source_dir / f".{task['task_id']}-{uuid.uuid4().hex}.tmp"
             try:
+                generator = self.generator_factory(settings)
+                observer = self._attempt_observer([task], settings, "single_fallback")
                 with self.generation_limiter.slot(1):
-                    generation = self.generator_factory(settings).generate(
+                    generation = generator.generate(
                         task["prompt"],
                         quality,
                         work_dir,
                         idempotency_key=task["generation_idempotency_key"],
+                        **self._set_observer_if_supported(
+                            generator, observer, "generate"
+                        ),
                     )
                 self._persist_generation(task, generation, started_at, "single_fallback")
             except Exception as exc:
@@ -1175,13 +1416,34 @@ class TaskManager:
             source_sha256=image.sha256,
             metrics_json=json.dumps(metrics, ensure_ascii=False),
         )
+        generation_duration = float(generation.total_seconds)
+        self.store.telemetry.try_event(
+            task_id,
+            "generation_completed",
+            occurred_at=time.time(),
+            duration_seconds=generation_duration,
+            details={"mode": generation_mode},
+        )
+        self.store.telemetry.try_event(
+            task_id,
+            "upscale_queued",
+            occurred_at=time.time(),
+        )
 
     def _fail_task(self, task_id: str, exc: Exception) -> None:
+        completed_at = time.time()
         self.store.update(
             task_id,
             status="failed",
-            completed_at=time.time(),
+            completed_at=completed_at,
             error=f"{type(exc).__name__}: {_scrub_error(exc)}",
+        )
+        category = normalize_error(exc)
+        self.store.telemetry.try_event(
+            task_id,
+            "terminal_failed",
+            occurred_at=completed_at,
+            details={"stage": "generation", "category": category},
         )
 
 
@@ -1779,6 +2041,46 @@ def submit_upscale(
             connection.commit()
         finally:
             connection.close()
+        remote_stage_seconds = (
+            None
+            if current["claimed_at"] is None
+            else max(0.0, completed_at - float(current["claimed_at"]))
+        )
+        upscale_duration = (
+            float(upscale_seconds)
+            if upscale_seconds is not None
+            else remote_stage_seconds
+        )
+        known_worker_seconds = sum(
+            float(value)
+            for value in (
+                source_download_seconds,
+                upscale_seconds,
+                postprocess_seconds,
+            )
+            if value is not None
+        )
+        delivery_duration = (
+            None
+            if remote_stage_seconds is None
+            else max(0.0, remote_stage_seconds - known_worker_seconds)
+        )
+        store.telemetry.try_event(
+            task_id,
+            "upscale_finished",
+            occurred_at=completed_at,
+            duration_seconds=upscale_duration,
+            attempt_no=int(current["upscale_attempts"] or 0),
+            worker_id=self_worker_id,
+            details={"outcome": "success"},
+        )
+        store.telemetry.try_event(
+            task_id,
+            "delivery_completed",
+            occurred_at=completed_at,
+            duration_seconds=delivery_duration,
+            worker_id=self_worker_id,
+        )
         try:
             (SOURCE_IMAGE_DIR / current["source_filename"]).unlink(missing_ok=True)
         except OSError:
