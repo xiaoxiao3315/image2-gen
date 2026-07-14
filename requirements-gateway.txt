@@ -1,0 +1,3 @@
+# Optional local hook/proxy development. Production uses the digest-pinned image
+# in deploy/litellm/docker-compose.yml.
+litellm[proxy]==1.91.2

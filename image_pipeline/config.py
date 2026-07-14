@@ -23,6 +23,16 @@ def _optional_float(name: str) -> float | None:
         raise ValueError(f"{name} must be a number") from exc
 
 
+def _nonnegative_int(name: str, default: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a non-negative integer") from exc
+    if value < 0:
+        raise ValueError(f"{name} must be a non-negative integer")
+    return value
+
+
 def _normalize_api_base_url(value: str) -> str:
     """Accept either a host root or an OpenAI-compatible /v1 base URL."""
     base = value.strip().rstrip("/")
@@ -36,6 +46,7 @@ class Settings:
     api_base_url: str
     api_key: str
     api_proxy: str | None
+    api_connect_timeout_seconds: float
     api_timeout_seconds: float
     output_root: Path
     model: str
@@ -66,6 +77,9 @@ class Settings:
             ),
             api_key=key,
             api_proxy=proxy or None,
+            api_connect_timeout_seconds=float(
+                os.getenv("IMAGE_API_CONNECT_TIMEOUT_SECONDS", "20")
+            ),
             api_timeout_seconds=float(os.getenv("IMAGE_API_TIMEOUT_SECONDS", "300")),
             output_root=Path(os.getenv("IMAGE_OUTPUT_ROOT", PROJECT_ROOT / "runs")),
             model=os.getenv("IMAGE_MODEL", "gpt-image-2"),
@@ -80,7 +94,10 @@ class Settings:
             ),
             upscaler_model=os.getenv("REALESRGAN_MODEL", "realesrgan-x4plus"),
             gpu_id=int(os.getenv("REALESRGAN_GPU_ID", "0")),
-            tile_size=int(os.getenv("REALESRGAN_TILE_SIZE", "256")),
+            # 0 asks Real-ESRGAN NCNN/Vulkan to process the whole image. This
+            # avoids visible seams caused by stitching small tiles on GPUs
+            # with enough VRAM. Operators can still set a positive tile size.
+            tile_size=_nonnegative_int("REALESRGAN_TILE_SIZE", 0),
             gpu_power_watts_estimate=float(os.getenv("GPU_POWER_WATTS", "175")),
             electricity_cny_per_kwh=float(
                 os.getenv("ELECTRICITY_CNY_PER_KWH", "0.60")

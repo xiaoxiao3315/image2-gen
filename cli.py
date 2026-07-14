@@ -8,6 +8,7 @@ from pathlib import Path
 
 from image_pipeline.config import Settings
 from image_pipeline.pipeline import ImagePipeline, TARGET_COST_CNY
+from image_pipeline.telemetry import TelemetryStore, parse_utc_timestamp
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -43,9 +44,26 @@ def _parser() -> argparse.ArgumentParser:
 
     commands.add_parser("cost-table", help="Show configured per-tier cost status")
 
+    telemetry_task = commands.add_parser(
+        "telemetry-task", help="Show a secret-safe task telemetry timeline"
+    )
+    telemetry_task.add_argument("--database", required=True, type=Path)
+    telemetry_task.add_argument("--task-id", required=True)
+
+    telemetry_stats = commands.add_parser(
+        "telemetry-stats", help="Show SQLite-derived telemetry window statistics"
+    )
+    telemetry_stats.add_argument("--database", required=True, type=Path)
+    telemetry_stats.add_argument("--since", required=True)
+    telemetry_stats.add_argument("--until")
+
     serve = commands.add_parser("serve", help="Run the local FastAPI service")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", default=8012, type=int)
+    commands.add_parser(
+        "upscale-worker",
+        help="Poll the cloud service and process claimed jobs with local Real-ESRGAN",
+    )
     return parser
 
 
@@ -107,6 +125,26 @@ def main() -> int:
                 completed += 1
                 print(f"completed {completed} item(s); last input line={line_number}", file=sys.stderr)
         return 0
+    if args.command == "telemetry-task":
+        telemetry = TelemetryStore(args.database, initialize=False)
+        try:
+            payload = telemetry.task_timeline(args.task_id)
+        except KeyError as exc:
+            raise SystemExit(str(exc)) from None
+        print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    if args.command == "telemetry-stats":
+        from datetime import datetime, timezone
+
+        since = parse_utc_timestamp(args.since)
+        until = (
+            parse_utc_timestamp(args.until)
+            if args.until
+            else datetime.now(tz=timezone.utc).timestamp()
+        )
+        payload = TelemetryStore(args.database, initialize=False).window_stats(since, until)
+        print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
     if args.command == "cost-table":
         settings = Settings.from_env(require_key=False)
         rows = []
@@ -125,7 +163,18 @@ def main() -> int:
     if args.command == "serve":
         import uvicorn
 
-        uvicorn.run("image_pipeline.service:app", host=args.host, port=args.port)
+        uvicorn.run(
+            "image_pipeline.service:app",
+            host=args.host,
+            port=args.port,
+            proxy_headers=True,
+            forwarded_allow_ips="*",
+        )
+        return 0
+    if args.command == "upscale-worker":
+        from image_pipeline.remote_worker import run_remote_worker
+
+        run_remote_worker()
         return 0
     return 2
 

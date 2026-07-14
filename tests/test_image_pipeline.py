@@ -3,7 +3,9 @@ from pathlib import Path
 from PIL import Image
 
 from image_pipeline.image_io import inspect_image
-from image_pipeline.config import _normalize_api_base_url
+import pytest
+
+from image_pipeline.config import Settings, _normalize_api_base_url
 from image_pipeline.upscaler import _cover_resize
 
 
@@ -37,3 +39,15 @@ def test_cover_resize_outputs_exact_2k(tmp_path: Path) -> None:
 def test_base_url_accepts_root_or_v1() -> None:
     assert _normalize_api_base_url("https://example.test") == "https://example.test/v1"
     assert _normalize_api_base_url("https://example.test/v1/") == "https://example.test/v1"
+
+
+def test_realesrgan_tile_defaults_to_full_frame_and_remains_configurable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("REALESRGAN_TILE_SIZE", raising=False)
+    assert Settings.from_env(require_key=False).tile_size == 0
+    monkeypatch.setenv("REALESRGAN_TILE_SIZE", "512")
+    assert Settings.from_env(require_key=False).tile_size == 512
+    monkeypatch.setenv("REALESRGAN_TILE_SIZE", "-1")
+    with pytest.raises(ValueError, match="non-negative"):
+        Settings.from_env(require_key=False)

@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Image2Gen seven-day retention cleanup daily
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+RandomizedDelaySec=15m
+Persistent=true
+Unit=image2-gen-cleanup.service
+
+[Install]
+WantedBy=timers.target
