@@ -38,6 +38,7 @@ from pydantic import AliasChoices, BaseModel, Field, field_validator
 from .config import PROJECT_ROOT, Settings
 from .generator import (
     GptImageGenerator,
+    ImageGenerationError,
     NativeBatchIncomplete,
     NativeBatchUnsupported,
 )
@@ -1438,7 +1439,17 @@ class TaskManager:
             completed_at=completed_at,
             error=f"{type(exc).__name__}: {_scrub_error(exc)}",
         )
-        category = normalize_error(exc)
+        if isinstance(exc, ImageGenerationError):
+            http_status = exc.http_status
+            phase = exc.phase
+        else:
+            http_status = None
+            phase = None
+        category = normalize_error(
+            exc,
+            http_status=http_status,
+            phase=phase,
+        )
         self.store.telemetry.try_event(
             task_id,
             "terminal_failed",

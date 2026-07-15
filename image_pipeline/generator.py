@@ -17,7 +17,16 @@ from .models import GenerationResult
 
 
 class ImageGenerationError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        http_status: int | None = None,
+        phase: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.http_status = http_status
+        self.phase = phase
 
 
 class NativeBatchUnsupported(ImageGenerationError):
@@ -32,8 +41,11 @@ class NativeBatchIncomplete(ImageGenerationError):
         message: str,
         partial_results: list[GenerationResult],
         requested_count: int,
+        *,
+        http_status: int | None = None,
+        phase: str | None = None,
     ) -> None:
-        super().__init__(message)
+        super().__init__(message, http_status=http_status, phase=phase)
         self.partial_results = partial_results
         self.requested_count = requested_count
 
@@ -349,11 +361,15 @@ class GptImageGenerator:
             )
             if n > 1 and _native_batch_is_explicitly_unsupported(response):
                 raise NativeBatchUnsupported(
-                    "Image API explicitly does not support native n > 1"
+                    "Image API explicitly does not support native n > 1",
+                    http_status=response.status_code,
+                    phase="request",
                 )
             # Deliberately avoid persisting or echoing arbitrary gateway response bodies.
             raise ImageGenerationError(
-                f"Image API returned HTTP {response.status_code}; response body omitted for secret safety"
+                f"Image API returned HTTP {response.status_code}; response body omitted for secret safety",
+                http_status=response.status_code,
+                phase="request",
             )
         try:
             payload = response.json()
