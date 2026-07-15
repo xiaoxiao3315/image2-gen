@@ -682,18 +682,199 @@ def test_retry_start_after_transient_initialization_failure(tmp_path: Path) -> N
     assert telemetry.enabled
 
 
-def test_oversized_details_remain_valid_json(tmp_path: Path) -> None:
-    database = tmp_path / "details.db"
-    telemetry = TelemetryStore(database)
-    details = {f"k{index:02d}": "a" * 120 for index in range(20)}
+@pytest.mark.parametrize(
+    ("event_type", "details"),
+    [
+        ("generation_queued", {"reason": "restart_recovery"}),
+        *[("generation_completed", {"mode": mode}) for mode in (
+            "single", "single_fallback", "native_n", "native_n_partial"
+        )],
+        *[("upscale_queued", {"reason": reason}) for reason in (
+            "lease_expired", "worker_release"
+        )],
+        *[("upscale_finished", {"outcome": outcome}) for outcome in (
+            "success", "retry", "failed", "lease_expired"
+        )],
+        *[("terminal_failed", {"stage": "generation", "category": category})
+          for category in sorted({
+              "connect_timeout", "read_timeout", "connection_error",
+              "remote_disconnect", "http_503", "http_429", "http_4xx",
+              "http_5xx", "invalid_response", "image_download_failure", "unknown",
+          })],
+        ("terminal_failed", {"stage": "upscale", "category": "worker_failure"}),
+    ],
+)
+def test_details_contract_preserves_current_producer_values(
+    tmp_path: Path, event_type: str, details: dict[str, str]
+) -> None:
+    store = TaskStore(tmp_path / f"{event_type}-{len(details)}.db")
+    task = store.create("p", "2k")
 
-    assert telemetry.try_event("task", "accepted", details=details)
+    assert store.telemetry.try_event(task["task_id"], event_type, details=details)
+
+    timeline = store.telemetry.task_timeline(task["task_id"])
+    assert timeline["events"][-1]["details"] == details
+
+
+@pytest.mark.parametrize(
+    ("event_type", "details"),
+    [
+        ("accepted", {"reason": "restart_recovery"}),
+        ("generation_queued", {"reason": "private-secret"}),
+        ("generation_queued", {"rea!son": "restart_recovery"}),
+        ("generation_completed", {"outcome": "success"}),
+        ("generation_completed", {"mode": "private-secret"}),
+        ("upscale_finished", {"mode": "single"}),
+        ("upscale_finished", {"outcome": "private-secret"}),
+        ("terminal_failed", {"stage": "upscale", "category": "read_timeout"}),
+        ("terminal_failed", {"stage": "generation", "category": "worker_failure"}),
+        ("terminal_failed", {"stage": "generation", "category": "private-secret"}),
+        ("generation_queued!", {"reason": "restart_recovery"}),
+        ("generation_completed", {"mode": []}),
+        ("upscale_queued", {"reason": {}}),
+        ("upscale_finished", {"outcome": []}),
+        ("terminal_failed", {"stage": "generation", "category": {}}),
+    ],
+)
+def test_details_contract_drops_invalid_cross_event_values(
+    tmp_path: Path, event_type: str, details: dict[str, Any]
+) -> None:
+    database = tmp_path / f"invalid-{event_type}-{len(details)}.db"
+    telemetry = TelemetryStore(database)
+
+    assert telemetry.try_event("task", event_type, details=details)
 
     with sqlite3.connect(database) as connection:
         stored = connection.execute("SELECT details_json FROM task_events").fetchone()[0]
-    decoded = json.loads(stored)
-    assert isinstance(decoded, dict)
-    assert len(stored) <= 2000
+    assert stored is None
+
+
+def test_details_contract_blocks_secrets_under_benign_keys(tmp_path: Path) -> None:
+    database = tmp_path / "secret-details.db"
+    store = TaskStore(database)
+    task = store.create("safe task", "2k")
+    secrets = {
+        "note": "unit-test-secret-key",
+        "label": "TOP SECRET PROMPT",
+        "value": "https://private.invalid/signed-image",
+    }
+
+    assert store.telemetry.try_event(task["task_id"], "accepted", details=secrets)
+
+    with sqlite3.connect(database) as connection:
+        stored = connection.execute(
+            "SELECT details_json FROM task_events WHERE task_id=? "
+            "ORDER BY occurred_at DESC,event_id DESC LIMIT 1",
+            (task["task_id"],),
+        ).fetchone()[0]
+    encoded = json.dumps(store.telemetry.task_timeline(task["task_id"]), ensure_ascii=False)
+    assert stored is None
+    assert all(secret not in encoded for secret in secrets.values())
+
+
+def test_unknown_event_persists_without_details(tmp_path: Path) -> None:
+    database = tmp_path / "unknown-event.db"
+    telemetry = TelemetryStore(database)
+
+    assert telemetry.try_event(
+        "task", "future_event", details={"note": "unit-test-secret-key"}
+    )
+
+    with sqlite3.connect(database) as connection:
+        row = connection.execute(
+            "SELECT event_type,details_json FROM task_events"
+        ).fetchone()
+    assert row[0] == "future_event"
+    assert row[1] is None
+
+
+def test_timeline_projects_legacy_details_without_rewriting_rows(tmp_path: Path) -> None:
+    database = tmp_path / "legacy-details.db"
+    store = TaskStore(database)
+    task = store.create("p", "2k")
+    legacy_rows = [
+        ("valid", "upscale_finished", '{"outcome":"success"}'),
+        (
+            "mixed",
+            "upscale_finished",
+            '{"note":"legacy-secret","outcome":"success"}',
+        ),
+        ("invalid", "upscale_finished", '{"outcome":"private-secret"}'),
+        ("unknown", "future_event", '{"note":"legacy-secret"}'),
+        ("array", "upscale_finished", '["success"]'),
+        ("malformed", "upscale_finished", '{not-json'),
+    ]
+    with sqlite3.connect(database) as connection:
+        connection.executemany(
+            "INSERT INTO task_events(event_id,task_id,event_type,occurred_at,details_json) "
+            "VALUES(?,?,?,?,?)",
+            [
+                (event_id, task["task_id"], event_type, 100 + index, details_json)
+                for index, (event_id, event_type, details_json) in enumerate(legacy_rows)
+            ],
+        )
+    before = {
+        event_id: details_json for event_id, _event_type, details_json in legacy_rows
+    }
+
+    timeline = store.telemetry.task_timeline(task["task_id"])
+    projected = {
+        event["event_id"]: event["details"]
+        for event in timeline["events"]
+        if event["event_id"] in before
+    }
+
+    assert projected == {
+        "valid": {"outcome": "success"},
+        "mixed": {"outcome": "success"},
+        "invalid": {},
+        "unknown": {},
+        "array": {},
+        "malformed": {},
+    }
+    assert "legacy-secret" not in json.dumps(timeline, ensure_ascii=False)
+    with sqlite3.connect(database) as connection:
+        after = dict(
+            connection.execute(
+                "SELECT event_id,details_json FROM task_events "
+                "WHERE event_id IN ('valid','mixed','invalid','unknown','array','malformed')"
+            ).fetchall()
+        )
+    assert after == before
+
+
+def test_details_projection_failures_do_not_drop_event(tmp_path: Path) -> None:
+    class UnhashableStr(str):
+        __hash__ = None  # type: ignore[assignment]
+
+    class ExplodingDict(dict[str, Any]):
+        def get(self, _key: str, _default: Any = None) -> Any:
+            raise TypeError("projection must not call custom mapping methods")
+
+    database = tmp_path / "hostile-details.db"
+    telemetry = TelemetryStore(database)
+    hostile_cases: list[tuple[str, dict[str, Any]]] = [
+        ("generation_completed", {"mode": UnhashableStr("single")}),
+        ("upscale_queued", {"reason": UnhashableStr("lease_expired")}),
+        ("upscale_finished", {"outcome": UnhashableStr("success")}),
+        (
+            "terminal_failed",
+            {"stage": "generation", "category": UnhashableStr("read_timeout")},
+        ),
+        ("generation_queued", ExplodingDict(reason="restart_recovery")),
+    ]
+
+    for index, (event_type, details) in enumerate(hostile_cases):
+        assert telemetry.try_event(
+            f"task-{index}", event_type, details=details
+        )
+
+    with sqlite3.connect(database) as connection:
+        rows = connection.execute(
+            "SELECT event_type,details_json FROM task_events ORDER BY task_id"
+        ).fetchall()
+    assert len(rows) == len(hostile_cases)
+    assert all(row[1] is None for row in rows)
 
 
 def test_read_only_cli_store_handles_pretelemetry_database(tmp_path: Path) -> None:

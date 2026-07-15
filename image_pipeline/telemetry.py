@@ -27,10 +27,14 @@ ERROR_CATEGORIES = {
     "unknown",
 }
 _TERMINAL_STATUSES = {"done", "failed"}
-_FORBIDDEN_DETAIL_KEY = re.compile(
-    r"prompt|token|authorization|header|url|endpoint|proxy|credential|secret|password|body|response",
-    re.IGNORECASE,
-)
+_GENERATION_MODES = {
+    "single",
+    "single_fallback",
+    "native_n",
+    "native_n_partial",
+}
+_UPSCALE_QUEUE_REASONS = {"lease_expired", "worker_release"}
+_UPSCALE_OUTCOMES = {"success", "retry", "failed", "lease_expired"}
 
 
 def hash_label(value: str | None) -> str | None:
@@ -113,41 +117,64 @@ def safe_error_summary(
     return ":".join(parts)[:160]
 
 
-def _finite_number(value: Any) -> float | int | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    if not math.isfinite(float(value)):
-        return None
-    return value
+def _project_details(
+    event_type: str,
+    details: Mapping[str, Any] | None,
+) -> dict[str, str]:
+    """Return only the canonical detail fields defined for this lifecycle event."""
+    if type(details) is not dict:
+        return {}
+
+    if event_type == "generation_queued":
+        reason = details.get("reason")
+        return (
+            {"reason": "restart_recovery"}
+            if type(reason) is str and reason == "restart_recovery"
+            else {}
+        )
+    if event_type == "generation_completed":
+        mode = details.get("mode")
+        return (
+            {"mode": mode}
+            if type(mode) is str and mode in _GENERATION_MODES
+            else {}
+        )
+    if event_type == "upscale_queued":
+        reason = details.get("reason")
+        return (
+            {"reason": reason}
+            if type(reason) is str and reason in _UPSCALE_QUEUE_REASONS
+            else {}
+        )
+    if event_type == "upscale_finished":
+        outcome = details.get("outcome")
+        return (
+            {"outcome": outcome}
+            if type(outcome) is str and outcome in _UPSCALE_OUTCOMES
+            else {}
+        )
+    if event_type == "terminal_failed":
+        stage = details.get("stage")
+        category = details.get("category")
+        if (
+            stage == "generation"
+            and type(category) is str
+            and category in ERROR_CATEGORIES
+        ):
+            return {"category": category, "stage": stage}
+        if stage == "upscale" and category == "worker_failure":
+            return {"category": category, "stage": stage}
+    return {}
 
 
-def _safe_details(details: Mapping[str, Any] | None) -> str | None:
-    if not details:
+def _safe_details(
+    event_type: str,
+    details: Mapping[str, Any] | None,
+) -> str | None:
+    projected = _project_details(event_type, details)
+    if not projected:
         return None
-    cleaned: dict[str, Any] = {}
-    for raw_key, raw_value in details.items():
-        key = re.sub(r"[^A-Za-z0-9_.-]", "", str(raw_key))[:64]
-        if not key or _FORBIDDEN_DETAIL_KEY.search(key):
-            continue
-        if raw_value is None or isinstance(raw_value, bool):
-            cleaned[key] = raw_value
-        elif (number := _finite_number(raw_value)) is not None:
-            cleaned[key] = number
-        elif isinstance(raw_value, str):
-            cleaned[key] = re.sub(r"[^A-Za-z0-9_.:-]", "_", raw_value)[:120]
-    if not cleaned:
-        return None
-    encoded = json.dumps(cleaned, sort_keys=True, separators=(",", ":"))
-    if len(encoded) <= 2000:
-        return encoded
-    bounded: dict[str, Any] = {}
-    for key, value in cleaned.items():
-        candidate = {**bounded, key: value}
-        candidate_encoded = json.dumps(candidate, sort_keys=True, separators=(",", ":"))
-        if len(candidate_encoded) > 2000:
-            break
-        bounded = candidate
-    return json.dumps(bounded, sort_keys=True, separators=(",", ":"))
+    return json.dumps(projected, sort_keys=True, separators=(",", ":"))
 
 
 def _decode_json(value: str | None, fallback: Any) -> Any:
@@ -385,6 +412,7 @@ class TelemetryStore:
             if not self._ensure_enabled():
                 return False
             duration = None if duration_seconds is None else max(0.0, float(duration_seconds))
+            safe_event_type = re.sub(r"[^A-Za-z0-9_.-]", "", event_type)[:80]
             with self._connect() as connection:
                 connection.execute(
                     "INSERT INTO task_events(event_id,task_id,event_type,occurred_at,"
@@ -393,12 +421,12 @@ class TelemetryStore:
                     (
                         uuid.uuid4().hex,
                         str(task_id),
-                        re.sub(r"[^A-Za-z0-9_.-]", "", event_type)[:80],
+                        safe_event_type,
                         time.time() if occurred_at is None else float(occurred_at),
                         duration,
                         attempt_no,
                         hash_label(worker_id),
-                        _safe_details(details),
+                        _safe_details(event_type, details),
                     ),
                 )
             return True
@@ -653,7 +681,8 @@ class TelemetryStore:
         event_items = []
         for row in events:
             item = dict(row)
-            item["details"] = _decode_json(item.pop("details_json"), {})
+            raw_details = _decode_json(item.pop("details_json"), {})
+            item["details"] = _project_details(item["event_type"], raw_details)
             event_items.append(item)
 
         combined = [
