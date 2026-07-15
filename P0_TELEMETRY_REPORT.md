@@ -8,13 +8,13 @@ Scope: additive, best-effort SQLite facts for reconstructing generation and task
 
 Implemented the P0 production fact layer without changing the existing `tasks` table, retry counts, retry backoff, generation limits, worker limits, lease rules, queue API, web UI, or deployment configuration. This is no longer described as a pure observation-only P0: it includes one authorized restart-recovery correction in `TaskStore.__init__`, ensuring every task actually reset from `running`/`processing` to `queued` receives exactly one `generation_queued(reason=restart_recovery)` fact. The correction does not change which tasks are recovered or any retry/concurrency/lease/API-response behavior.
 
-No real image API was called. No production service was started. Disposable local FastAPI instances and loopback fake providers were used only for acceptance. No deployment was run. No commit was created.
+No real image API was called. No production service was started. Disposable local FastAPI instances and loopback fake providers were used only for acceptance. No deployment was run. P0/P0.1 were committed only to `feat/p0-production-telemetry`; the default branch was not modified or merged.
 
 ## Scope separation: P0, authorized recovery correction, and P0.1
 
 - **P0 telemetry** is the additive fact layer described in this report.
 - **Authorized restart-recovery correction** is one deliberate business-implementation change in `TaskStore.__init__`: after the authoritative recovery transaction identifies tasks reset from `running`/`processing` to `queued`, each identified task gets one best-effort `generation_queued(reason=restart_recovery)` fact regardless of whether its old open attempt was reconciled. A second initialization does not duplicate the event because the task is already `queued`; an originally queued task is not mislabeled as restart-recovered.
-- **P0.1 error-classification correction** is a separate, uncommitted review increment. `normalize_error` inspects the current exception first and, only if it is unknown, follows explicit `__cause__` for at most two hops with cycle protection. It never reads implicit `__context__`.
+- **P0.1 error-classification correction** is a separate committed increment on `feat/p0-production-telemetry`. `normalize_error` inspects the current exception first and, only if it is unknown, follows explicit `__cause__` for at most two hops with cycle protection. It never reads implicit `__context__`.
 - Current acceptance evidence uses Hermes Python 3.11.15 / pytest 9.1.1 with inherited service-authentication variables removed: restart recovery target `1 passed in 1.12s`; exact four-worker concurrency target `1 passed in 2.73s`; final complete suite `106 passed in 25.80s`; AST `ast ok`.
 - Earlier `101`, `102`, and `105`-test totals are retained below only as historical audit evidence, not current acceptance evidence.
 
@@ -40,7 +40,7 @@ Append-only lifecycle facts with:
 - UTC epoch timestamp;
 - optional duration and attempt number;
 - irreversible worker hash;
-- bounded, key-filtered `details_json` (value-level secret allowlisting is deferred to P0.2).
+- event-specific, value-allowlisted `details_json`; unsupported details are discarded on write and hidden from timeline output.
 
 Observed lifecycle includes:
 
@@ -129,7 +129,7 @@ A separate lock-contention test holds `BEGIN IMMEDIATE`; the telemetry call retu
 
 ## P0.1 cause-only correction evidence
 
-The later error-classification correction is not part of the pure P0 telemetry scope. It is tracked as P0.1 and is still uncommitted pending main Atlas review.
+The later error-classification correction is not part of the pure P0 telemetry scope. It is tracked as P0.1 and is committed separately on `feat/p0-production-telemetry`.
 
 - Classification first uses the current exception type.
 - If that is unknown, it follows only explicit `__cause__`, never implicit `__context__`.
@@ -163,7 +163,9 @@ That earlier `102 passed` run is not current acceptance evidence because its cla
 
 Additional checks:
 
-- Final complete suite with the authorized recovery correction and exact concurrency assertion: `106 passed in 25.80s`.
+- Final complete suite with the authorized recovery correction, exact concurrency assertion, P0.1 cause-only classification, and P0.2 details contract: `147 passed in 39.12s`.
+- Complete telemetry suite including final hostile-object, details-contract, and legacy-projection coverage: `69 passed in 13.81s`.
+- Focused P0.2 details contract matrix after adversarial review: `42 passed, 27 deselected in 12.32s`.
 - Restart recovery target, including exactly-once and no-mislabel assertions: `1 passed in 1.12s`.
 - Exact four-worker concurrency target: `1 passed in 2.73s`.
 - `tests/test_telemetry.py` AST parse: `ast ok`.
@@ -193,15 +195,41 @@ Not implemented:
 6. **Telemetry never fails business behavior** — met by non-throwing store/observer boundaries, short SQLite timeout, lock test, and fake-generator compatibility.
 7. **Read-only reproducible task/window queries** — met through CLI and module queries with deterministic tie-breakers.
 8. **Retention cleanup** — met for direct task rows and batch-attributed native attempts; old databases without telemetry tables remain compatible.
-9. **No known prompt/body/credential fields in current producers** — current producers, provider request-ID hashing, safe summaries, synthetic security tests, CLI smoke tests, and changed-file scans exclude the known sensitive fields tested. Generic benign-key string values are not yet value-allowlisted; that gap is explicitly deferred to P0.2 and this report does not claim it is closed.
-10. **No unauthorized behavior/deploy/real-call/commit overreach** — implementation evidence is present and the complete suite passes. The scope explicitly includes one authorized restart-recovery correction in `TaskStore.__init__`; no retry/concurrency/worker-limit/lease/API-response behavior was changed. Final acceptance remains with the main Atlas reviewer. No image2-gen commit, deployment, or real provider call occurred.
+9. **No known sensitive payload persistence/output in supported details contracts** — current producers, event-specific detail key/value projection, provider request-ID hashing, safe summaries, synthetic security tests, CLI smoke tests, and changed-file scans exclude the known sensitive fields tested. Unsupported details are discarded on write and hidden when legacy rows are read through `task_timeline`; existing raw legacy rows are not rewritten.
+10. **No unauthorized behavior/deploy/real-call/merge overreach** — implementation evidence is present and the complete suite passes. The scope explicitly includes one authorized restart-recovery correction in `TaskStore.__init__`; no retry/concurrency/worker-limit/lease/API-response behavior was changed. P0/P0.1 were committed and pushed only to `feat/p0-production-telemetry`; no deployment, real provider call, default-branch merge, or direct default-branch push occurred.
 
-## Deferred P0.2 / optimization findings
+## P0.2 details contract closure
 
-The following reviewed findings are intentionally not changed in this round and remain separate follow-up work:
+The benign-key sensitive-value gap in `task_events.details_json` is closed by an event-specific, closed key/value contract:
 
-- generic `details_json` values can carry sensitive text under a benign key;
-- all-503 exhaustion can leave the physical attempt as `http_503` but the task terminal category as `unknown`;
+- `generation_queued`: `reason=restart_recovery`;
+- `generation_completed`: `mode` in `single`, `single_fallback`, `native_n`, `native_n_partial`;
+- `upscale_queued`: `reason` in `lease_expired`, `worker_release`;
+- `upscale_finished`: `outcome` in `success`, `retry`, `failed`, `lease_expired`;
+- `terminal_failed`: `stage=generation` with a declared error category, or `stage=upscale` with `category=worker_failure`.
+
+All other details are discarded. Unknown event types still persist, but without details; event-type vocabulary enforcement remains deferred. The same projection runs before new writes and when `task_timeline` reads legacy rows. Valid legacy fields remain visible, unsupported or sensitive extras are hidden, and the original SQLite rows are not rewritten. No schema migration is required.
+
+Adversarial coverage includes benign keys carrying prompt/token/URL text, known keys with invalid or unhashable values, cross-event keys, punctuation aliases that sanitize to known event names, unknown events, malformed/non-object legacy JSON, and read-time verification that legacy raw rows remain unchanged.
+
+## P0.3 terminal HTTP classification closure
+
+Terminal task classification now carries the final physical request's structured HTTP status through the trusted `ImageGenerationError` family:
+
+- exhausted HTTP 503 classifies as `http_503` at both the physical attempt and task terminal event;
+- non-retried HTTP 429, other 4xx, and 5xx classify as `http_429`, `http_4xx`, and `http_5xx` respectively;
+- explicit native-batch unsupported errors retain status/phase while preserving existing fallback behavior;
+- retry count, backoff, `will_retry`, idempotency, native fallback, concurrency, lease, and API behavior are unchanged;
+- exceptions outside the `ImageGenerationError` contract cannot spoof status/phase metadata or trigger arbitrary attribute descriptors; they keep existing fallback classification.
+
+Review found one trusted-boundary issue in the initial implementation: `_fail_task` used generic `getattr` on any exception. The final implementation accepts structured metadata only from `ImageGenerationError`, with regression coverage for misleading and hostile exception attributes.
+
+Final local acceptance after review: focused P0.3 `13 passed in 3.50s`; P0.2 + P0.3 regression `82 passed in 19.17s`; complete suite `160 passed in 37.44s`; changed Python AST parse `ast ok`; `git diff --check` passed with Windows LF/CRLF warnings only; targeted changed-file secret-pattern scan returned no matches. No real provider call, service deployment, retry-policy change, default-branch merge, or direct default-branch push occurred.
+
+## Deferred optimization findings
+
+The following reviewed findings remain separate follow-up work:
+
 - read-only task timelines can fail against a partial telemetry schema;
 - attempt-number allocation and some statistics paths scan retained history;
 - generation queue latency is anchored to task creation rather than the latest queue episode;
